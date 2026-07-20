@@ -1,0 +1,7 @@
+/target/
+/codesign/
+/.claude/
+/release/*.exe
+/release/*.zip
+/release/*.cer
+/release/latest.json
