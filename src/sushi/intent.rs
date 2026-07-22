@@ -27,6 +27,13 @@ pub enum Intent {
     ChainScreen {
         limit: usize,
     },
+    /// One specific ticker on Robinhood Chain, looked up against the indexer
+    /// rather than the curated registry — this is the door for a token that
+    /// isn't (and will never be) on the `price`/`quote` whitelist, like
+    /// anything that just launched.
+    TokenLookup {
+        ticker: String,
+    },
     Price {
         chain: &'static Chain,
         token: &'static Token,
@@ -45,9 +52,15 @@ pub fn system_prompt() -> String {
     format!(
         "You translate a user's crypto question into one JSON object. Reply with \
 the JSON only — no prose, no code fence.\n\n\
+The message may start with a recap of recent conversation turns, ending in a line \
+starting \"New question:\". If so, use the recap only to resolve what a vague \
+follow-up refers to (\"the second one\", \"and that one's volume\") — answer the new \
+question, never the old ones, and never repeat a prior answer instead of producing \
+a fresh JSON object.\n\n\
 Shapes:\n\
   {{\"action\":\"market\",\"sort\":\"volume|market_cap|gainers|losers\",\"limit\":10}}\n\
   {{\"action\":\"screen\",\"limit\":20}}\n\
+  {{\"action\":\"lookup\",\"ticker\":\"<symbol>\"}}\n\
   {{\"action\":\"price\",\"chain\":\"<chain>\",\"token\":\"<symbol>\"}}\n\
   {{\"action\":\"quote\",\"chain\":\"<chain>\",\"tokenIn\":\"<symbol>\",\
 \"tokenOut\":\"<symbol>\",\"amount\":\"<decimal>\"}}\n\
@@ -71,10 +84,17 @@ and symbols:\n{}\n\
 Rules for price/quote:\n\
 - Never output a contract address. Only symbols from the list above.\n\
 - If the chain is not stated, use Ethereum.\n\
-- If the user names a token that is NOT in that list, do not refuse — answer \
-with \"market\" instead so they at least see live data.\n\
+- If the user names a specific token that is NOT in that list, do not refuse and do \
+not fall back to \"market\" — answer with \"lookup\" instead, ticker as typed. This \
+is the common case: most tokens trading on Robinhood Chain (anything freshly \
+launched, any ticker you don't recognise) are not and will never be on that list.\n\
 - \"amount\" is a plain decimal string of the input token, e.g. \"0.5\". Never \
 convert it to base units, never do arithmetic.\n\n\
+Use \"lookup\" for a specific ticker not in the whitelist above — a coin someone \
+just mentioned by name, asking \"how's X doing\", \"what's X\", \"pull up X\". \
+Strip a leading $ if present. This only resolves tokens actually trading on \
+Robinhood Chain; if it doesn't exist there, that surfaces as an error, not a \
+reason to avoid trying.\n\n\
 Use \"unknown\" ONLY when the question has nothing to do with crypto, tokens, \
 prices or trading. Never use it merely because a coin or chain is missing.",
         tokens::catalog()
@@ -121,6 +141,14 @@ pub fn parse(raw: &str) -> Result<Intent, String> {
             let limit =
                 v["limit"].as_u64().unwrap_or(20).clamp(1, SCREEN_LIMIT_MAX as u64);
             Ok(Intent::ChainScreen { limit: limit as usize })
+        }
+        "lookup" => {
+            let ticker = v["ticker"]
+                .as_str()
+                .map(|s| s.trim().trim_start_matches('$').to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or("missing `ticker` in the model's answer")?;
+            Ok(Intent::TokenLookup { ticker })
         }
         "price" => {
             let chain = chain_of(&v)?;
@@ -169,6 +197,19 @@ mod tests {
         assert_eq!(token_in.symbol, "ETH");
         assert_eq!(token_out.symbol, "USDC");
         assert_eq!(amount_raw, 500_000_000_000_000_000);
+    }
+
+    #[test]
+    fn parses_a_lookup_and_strips_a_leading_dollar() {
+        let i = parse(r#"{"action":"lookup","ticker":"$PONS"}"#).unwrap();
+        let Intent::TokenLookup { ticker } = i else { panic!("expected a lookup") };
+        assert_eq!(ticker, "PONS");
+    }
+
+    #[test]
+    fn refuses_a_lookup_with_no_ticker() {
+        assert!(parse(r#"{"action":"lookup"}"#).is_err());
+        assert!(parse(r#"{"action":"lookup","ticker":""}"#).is_err());
     }
 
     #[test]

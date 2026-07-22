@@ -193,6 +193,51 @@ struct LogLine {
     ok: bool,
 }
 
+enum ChatAnswer {
+    Result(Outcome),
+    Error(String),
+}
+
+struct ChatTurn {
+    question: String,
+    answer: ChatAnswer,
+}
+
+/// Compact recap of the last few turns, handed to the model ahead of a new
+/// question so "the second one" or "and that one's volume" has something to
+/// resolve against. Plain summaries, not the full card data — the model only
+/// ever needs enough to disambiguate what's being asked about, and Rust
+/// re-fetches real numbers for whatever it decides on regardless.
+fn chat_recap(chat: &[ChatTurn], max_turns: usize) -> String {
+    if chat.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Recent conversation, oldest first:\n");
+    for turn in chat.iter().rev().take(max_turns).collect::<Vec<_>>().into_iter().rev() {
+        let summary = match &turn.answer {
+            ChatAnswer::Result(Outcome::Token { info, .. }) => {
+                format!("looked up {} — ${}", info.symbol, info.price_usd)
+            }
+            ChatAnswer::Result(Outcome::Price { symbol, usd, .. }) => {
+                format!("{symbol} price — ${usd}")
+            }
+            ChatAnswer::Result(Outcome::Quote { quote, .. }) => {
+                format!("quoted {} to {}", quote.token_in.symbol, quote.token_out.symbol)
+            }
+            ChatAnswer::Result(Outcome::Screen { rows, .. }) => {
+                let names: Vec<&str> = rows.iter().take(5).map(|r| r.symbol.as_str()).collect();
+                format!("screened Robinhood Chain — top: {}", names.join(", "))
+            }
+            ChatAnswer::Result(Outcome::Market { rows, .. }) => {
+                format!("showed the wider market, {} rows", rows.len())
+            }
+            ChatAnswer::Error(e) => format!("error — {e}"),
+        };
+        out.push_str(&format!("Q: {}\nA: {summary}\n", turn.question));
+    }
+    out
+}
+
 pub struct SushiTool {
     ask: String,
     ticker: String,
@@ -208,7 +253,14 @@ pub struct SushiTool {
     /// When the in-flight request started, so the thinking line can advance
     /// through its phrases instead of sitting on one.
     busy_since: Option<Instant>,
-    result: Option<Result<Outcome, String>>,
+    /// The question a spawned job is answering, held here rather than read
+    /// back from the text field — the user may already be typing the next
+    /// one by the time this one resolves.
+    pending_question: Option<String>,
+    /// The conversation, oldest first. Both doors onto the agent — the
+    /// ticker box and the ask box — land here, so "the second one" in a
+    /// follow-up has something to mean.
+    chat: Vec<ChatTurn>,
     log: Vec<LogLine>,
     market: Vec<market::Row>,
     market_rx: Option<Receiver<Result<Vec<market::Row>, String>>>,
@@ -252,7 +304,8 @@ impl Default for SushiTool {
             ai_input: String::new(),
             rx: None,
             busy_since: None,
-            result: None,
+            pending_question: None,
+            chat: Vec::new(),
             log: Vec::new(),
             market: Vec::new(),
             market_rx: None,
@@ -281,7 +334,6 @@ fn sushi_key_path(cfg: &std::path::Path) -> std::path::PathBuf {
     cfg.join("sushi.key")
 }
 
-/// Execute an already-resolved intent. No model involved past this point.
 /// Flattens the board into the same fields it renders — symbol, price, 24h
 /// change, volume, age, DEX — so the model reads exactly what the table below
 /// its take will show, not a differently-shaped summary that could disagree
@@ -302,8 +354,22 @@ fn screen_brief(rows: &[trending::Row]) -> String {
     out
 }
 
+/// Execute an already-resolved intent. Past this point nothing invents a
+/// number — every branch either calls a real API or fails.
 fn run(intent: Intent, api_key: &str, ai_key: &str) -> Result<Outcome, String> {
     match intent {
+        Intent::TokenLookup { ticker } => {
+            let info = trending::lookup(&ticker)?;
+            let take = if ai_key.trim().is_empty() {
+                String::new()
+            } else {
+                use crate::llm::LlmProvider;
+                crate::llm::Anthropic::new(ai_key.to_string())
+                    .complete(TAKE_SYSTEM, &info.brief())
+                    .unwrap_or_else(|e| format!("(no read: {e})"))
+            };
+            Ok(Outcome::Token { info: Box::new(info), take })
+        }
         Intent::Market { sort, limit } => {
             Ok(Outcome::Market { rows: market::fetch(sort, limit)?, sort, limit })
         }
@@ -431,6 +497,7 @@ impl SushiTool {
     fn spawn(
         &mut self,
         ctx: &egui::Context,
+        question: String,
         job: impl FnOnce() -> Result<Outcome, String> + Send + 'static,
     ) {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -439,6 +506,7 @@ impl SushiTool {
         });
         self.rx = Some(rx);
         self.busy_since = Some(Instant::now());
+        self.pending_question = Some(question);
         ctx.request_repaint();
     }
 
@@ -545,35 +613,34 @@ impl SushiTool {
         if ticker.is_empty() {
             return;
         }
+        self.ticker.clear();
         let ai_key = self.ai_key.clone();
-        self.spawn(ctx, move || {
-            let info = trending::lookup(&ticker)?;
-            let take = if ai_key.trim().is_empty() {
-                String::new()
-            } else {
-                use crate::llm::LlmProvider;
-                // A failed take must not lose the numbers, so the error is
-                // shown in place of the comment rather than raised.
-                crate::llm::Anthropic::new(ai_key)
-                    .complete(TAKE_SYSTEM, &info.brief())
-                    .unwrap_or_else(|e| format!("(no read: {e})"))
-            };
-            Ok(Outcome::Token { info: Box::new(info), take })
+        let api_key = self.sushi_key.clone();
+        let label = format!("${ticker}");
+        // Same intent the chat path reaches for the same question — the box
+        // and a typed question are two doors onto one lookup, not two.
+        self.spawn(ctx, label, move || {
+            run(Intent::TokenLookup { ticker }, &api_key, &ai_key)
         });
     }
 
-    /// Natural language path: model parses, Rust resolves and runs.
+    /// Natural language path: model parses, Rust resolves and runs. Recent
+    /// turns ride along as context, so a follow-up like "and the second one"
+    /// has something to resolve against — the model only ever uses that to
+    /// decide *what* to look up, never to invent an answer on its own.
     fn ask_model(&mut self, ctx: &egui::Context) {
         let question = self.ask.trim().to_string();
         if question.is_empty() {
             return;
         }
+        self.ask.clear();
         let ai_key = self.ai_key.clone();
         let api_key = self.sushi_key.clone();
-        self.spawn(ctx, move || {
+        let prompt = format!("{}New question: {question}", chat_recap(&self.chat, 3));
+        self.spawn(ctx, question, move || {
             use crate::llm::LlmProvider;
             let raw = crate::llm::Anthropic::new(ai_key.clone())
-                .complete(&intent::system_prompt(), &question)?;
+                .complete(&intent::system_prompt(), &prompt)?;
             run(intent::parse(&raw)?, &api_key, &ai_key)
         });
     }
@@ -613,7 +680,11 @@ impl SushiTool {
             match rx.try_recv() {
                 Ok(outcome) => {
                     self.record(&outcome);
-                    // A market intent updates the table; everything else the card.
+                    let question = self.pending_question.take().unwrap_or_default();
+                    // A market intent updates the persistent table below and
+                    // says nothing in the thread; everything else becomes a
+                    // turn — that split predates the chat history and is
+                    // unchanged by it.
                     match outcome {
                         Ok(Outcome::Market { rows, sort, limit }) => {
                             self.market = rows;
@@ -621,9 +692,9 @@ impl SushiTool {
                             self.market_limit = limit;
                             self.market_err = None;
                             self.market_at = Some(Instant::now());
-                            self.result = None;
                         }
-                        other => self.result = Some(other),
+                        Ok(o) => self.chat.push(ChatTurn { question, answer: ChatAnswer::Result(o) }),
+                        Err(e) => self.chat.push(ChatTurn { question, answer: ChatAnswer::Error(e) }),
                     }
                     self.rx = None;
                 }
@@ -989,17 +1060,30 @@ impl SushiTool {
         }
         ui.add_space(14.0);
 
-        // While a request is out, the thinking line replaces the answer rather
-        // than sitting beside a stale one — the panel should never show a fresh
-        // spinner above an old number and let you mistake it for the new one.
+        // The conversation, oldest first. Only the last turn — and only if
+        // it's a lookup — gets live swap controls; everything before it is
+        // a record of what was asked and found, not a second live surface.
         let mut swap_action = None;
-        if busy {
-            thinking_line(ui, self.busy_since, t);
-        } else {
-            match &self.result {
-                Some(Ok(Outcome::Token { info, take })) => {
+        if self.chat.is_empty() && !busy {
+            ui.label(
+                RichText::new(
+                    "Nothing signs or sends on its own — a swap only ever starts \
+                     from a button you click, and only ever confirms in Frame.",
+                )
+                .color(FAINT)
+                .small(),
+            );
+        }
+        let last_idx = self.chat.len().saturating_sub(1);
+        for (i, turn) in self.chat.iter().enumerate() {
+            ui.add_space(if i == 0 { 0.0 } else { 14.0 });
+            ui.label(RichText::new(&turn.question).color(DIM).strong());
+            ui.add_space(4.0);
+            match &turn.answer {
+                ChatAnswer::Result(Outcome::Token { info, take }) => {
+                    let interactive = i == last_idx;
                     let step = self.swap_step.lock().unwrap().clone();
-                    swap_action = token_card(
+                    let a = token_card(
                         ui,
                         info,
                         take,
@@ -1008,23 +1092,27 @@ impl SushiTool {
                         self.swap_rx.is_some(),
                         step.label(),
                         &self.swap_result,
+                        interactive,
                     );
+                    if interactive {
+                        swap_action = a;
+                    }
                 }
-                Some(Ok(outcome)) => result_card(ui, outcome),
-                Some(Err(e)) => {
+                ChatAnswer::Result(outcome) => result_card(ui, outcome),
+                ChatAnswer::Error(e) => {
                     ui.label(RichText::new(format!("✗ {e}")).color(RED));
                 }
-                None => {
-                    ui.label(
-                        RichText::new(
-                            "Nothing signs or sends on its own — a swap only ever starts \
-                             from a button you click, and only ever confirms in Frame.",
-                        )
-                        .color(FAINT)
-                        .small(),
-                    );
-                }
             }
+        }
+        // The in-flight turn: the question already reads like part of the
+        // thread, the answer is still the thinking line until it lands.
+        if busy {
+            ui.add_space(if self.chat.is_empty() { 0.0 } else { 14.0 });
+            if let Some(q) = &self.pending_question {
+                ui.label(RichText::new(q).color(DIM).strong());
+                ui.add_space(4.0);
+            }
+            thinking_line(ui, self.busy_since, t);
         }
         if let Some(action) = swap_action {
             let ctx = ui.ctx().clone();
@@ -1478,6 +1566,10 @@ struct SwapAction {
 /// is what actually starts the job, same split as `trending_row`'s click
 /// returning `bool` rather than reaching into `self` from inside the table.
 #[allow(clippy::too_many_arguments)]
+/// `interactive` gates the swap block entirely — false for every turn but the
+/// latest in the chat thread, so an old lookup reads as history rather than
+/// as a second live control surface for the one wallet session.
+#[allow(clippy::too_many_arguments)]
 fn token_card(
     ui: &mut egui::Ui,
     info: &trending::Info,
@@ -1487,6 +1579,7 @@ fn token_card(
     swap_busy: bool,
     swap_step: &str,
     swap_result: &Option<Result<SwapDone, String>>,
+    interactive: bool,
 ) -> Option<SwapAction> {
     ui.horizontal(|ui| {
         ui.label(
@@ -1600,9 +1693,12 @@ fn token_card(
 
     // The swap block. Absent entirely without a connected wallet, rather than
     // shown disabled — a greyed-out button invites clicking it to see what
-    // happens, and what happens should never be "nothing, silently".
+    // happens, and what happens should never be "nothing, silently". Absent
+    // too on a non-interactive (historical) card, regardless of wallet state.
     let mut action = None;
-    if let Some(from) = wallet {
+    if !interactive {
+        // Nothing — a past turn is a record, not a second place to trade from.
+    } else if let Some(from) = wallet {
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(10.0);
