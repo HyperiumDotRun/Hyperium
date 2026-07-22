@@ -8,6 +8,14 @@
 //! precisely so the model can never invent an address; here the addresses come
 //! from the indexer itself, which is a source of truth rather than a guess, so
 //! a token nobody has ever heard of is still safe to display.
+//!
+//! Read literally, this module is not "Sushi" data: Dexscreener indexes every
+//! AMM live on the chain, and on Robinhood Chain that is overwhelmingly
+//! Uniswap — a spot check across the three quote tokens below found 71
+//! `uniswap`-labelled pools against a single `sushiswap` one. The price and
+//! quote paths in `api.rs` are Sushi's own routing API; this board is not, and
+//! `dex_id` is carried on every row so the UI can say so rather than imply
+//! otherwise.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -43,6 +51,16 @@ pub struct Row {
     /// Pool creation, epoch ms. Age is what tells a fresh launch from a
     /// survivor, and it is the column a curated list can never have.
     pub created_at_ms: Option<u64>,
+    /// Dexscreener's slug for the AMM this pool runs on — "uniswap",
+    /// "sushiswap", "pancakeswap"... Carried through so the board can label a
+    /// row honestly instead of trading under a brand it did not earn.
+    pub dex_id: String,
+}
+
+/// True for Dexscreener's own spelling of Sushi's pools. Exact match, not a
+/// substring check — nothing here should light up on a coincidence.
+pub fn is_sushi(dex_id: &str) -> bool {
+    dex_id.eq_ignore_ascii_case("sushiswap")
 }
 
 /// Everything the indexer knows about one token, for the lookup card.
@@ -67,6 +85,7 @@ pub struct Info {
     pub sells_h24: u64,
     pub created_at_ms: Option<u64>,
     pub url: String,
+    pub dex_id: String,
 }
 
 impl Info {
@@ -90,11 +109,13 @@ impl Info {
             None => "unknown".into(),
         };
         format!(
-            "token: {} ({})\nprice: ${}\nchange 5m/1h/6h/24h: {} / {} / {} / {}\n\
+            "token: {} ({})\ntraded on: {} (Robinhood Chain)\nprice: ${}\n\
+             change 5m/1h/6h/24h: {} / {} / {} / {}\n\
              volume 1h: ${:.0}\nvolume 24h: ${:.0}\nliquidity: ${:.0}\nmarket cap: {}\n\
              buys/sells 24h: {} / {}\npool age: {}",
             self.symbol,
             self.name,
+            self.dex_id,
             self.price_usd,
             pct(self.change_m5),
             pct(self.change_h1),
@@ -243,6 +264,7 @@ pub fn lookup(query: &str) -> Result<Info, String> {
         sells_h24: txns["sells"].as_u64().unwrap_or(0),
         created_at_ms: best["pairCreatedAt"].as_u64(),
         url: best["url"].as_str().unwrap_or_default().to_string(),
+        dex_id: best["dexId"].as_str().unwrap_or("unknown").to_string(),
     })
 }
 
@@ -289,6 +311,7 @@ fn rank(raw: &[Value], limit: usize) -> Vec<Row> {
             volume_h24,
             liquidity_usd: num(&p["liquidity"]["usd"]).unwrap_or(0.0),
             created_at_ms: p["pairCreatedAt"].as_u64(),
+            dex_id: p["dexId"].as_str().unwrap_or("unknown").to_string(),
         };
 
         match best.iter_mut().find(|r| r.address.eq_ignore_ascii_case(&row.address)) {
@@ -318,8 +341,23 @@ mod tests {
             "volume": { "h24": vol },
             "liquidity": { "usd": 1000.0 },
             "pairCreatedAt": 1_700_000_000_000u64,
-            "url": "https://dexscreener.com/robinhood/x"
+            "url": "https://dexscreener.com/robinhood/x",
+            "dexId": "uniswap"
         })
+    }
+
+    #[test]
+    fn is_sushi_matches_only_the_exact_slug() {
+        assert!(is_sushi("sushiswap"));
+        assert!(is_sushi("SushiSwap"));
+        assert!(!is_sushi("uniswap"));
+        assert!(!is_sushi("sushi"));
+    }
+
+    #[test]
+    fn carries_the_dex_id_through() {
+        let raw = vec![pair("X", "0xx", 1.0)];
+        assert_eq!(rank(&raw, 10)[0].dex_id, "uniswap");
     }
 
     #[test]

@@ -84,13 +84,14 @@ const TABLE_W: f32 =
 // Launch board. Prices here run to eight significant figures, so its price
 // column is wider than the market table's.
 const T_RANK: f32 = 30.0;
-const T_SYM: f32 = 116.0;
-const T_PRICE: f32 = 128.0;
+const T_SYM: f32 = 108.0;
+const T_DEX: f32 = 86.0;
+const T_PRICE: f32 = 120.0;
 const T_CHG: f32 = 100.0;
 const T_VOL: f32 = 112.0;
 const T_LIQ: f32 = 108.0;
 const T_AGE: f32 = 66.0;
-const T_TABLE_W: f32 = T_RANK + T_SYM + T_PRICE + T_CHG + T_VOL + T_LIQ + T_AGE;
+const T_TABLE_W: f32 = T_RANK + T_SYM + T_DEX + T_PRICE + T_CHG + T_VOL + T_LIQ + T_AGE;
 
 enum Outcome {
     Price { chain: &'static str, symbol: String, address: String, usd: f64 },
@@ -387,10 +388,8 @@ impl SushiTool {
         let loading = self.trending_rx.is_some();
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("LAUNCHING ON ROBINHOOD").color(ORANGE).small().strong());
-            ui.label(
-                RichText::new("Uniswap pools · by 24h volume").color(FAINT).small(),
-            );
+            ui.label(RichText::new("TRADING ON ROBINHOOD CHAIN").color(ORANGE).small().strong());
+            ui.label(RichText::new("every DEX · by 24h volume").color(FAINT).small());
             if loading {
                 ui.add(egui::Spinner::new().size(13.0).color(ORANGE));
             } else if let Some(at) = self.trending_at {
@@ -405,7 +404,8 @@ impl SushiTool {
         ui.label(
             RichText::new(
                 "Straight off the chain's own pools — a token shows up here minutes after \
-                 someone launches it. AGE is how long the pool has existed.",
+                 someone launches it. DEX names which AMM the pool actually runs on: most of \
+                 this chain trades on Uniswap, and a Sushi-labelled row is called out below.",
             )
             .color(DIM)
             .small(),
@@ -887,6 +887,26 @@ fn thinking_line(ui: &mut egui::Ui, since: Option<Instant>, t: f64) {
     });
 }
 
+/// The one honest flourish on the board: a Sushi pool gets the tool's own
+/// accent so it stands out from the Uniswap rows around it, since that
+/// contrast is the whole point of carrying `dex_id` at all.
+fn dex_badge(p: &egui::Painter, pos: egui::Pos2, dex_id: &str) {
+    let sushi = trending::is_sushi(dex_id);
+    let label = if sushi { "Sushi" } else { dex_id };
+    let color = if sushi { ACCENT } else { DIM };
+    let font = FontId::proportional(11.5);
+    if sushi {
+        let size = p.layout_no_wrap(label.to_string(), font.clone(), color).size();
+        let pad = egui::vec2(5.0, 2.0);
+        let rect = egui::Rect::from_min_size(
+            pos - egui::vec2(pad.x, size.y / 2.0 + pad.y),
+            size + pad * 2.0,
+        );
+        p.rect_filled(rect, 3.0, ACCENT.gamma_multiply(0.16));
+    }
+    p.text(pos, egui::Align2::LEFT_CENTER, truncate(label, 11), font, color);
+}
+
 fn trending_header(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(T_TABLE_W, 20.0), egui::Sense::hover());
     let p = ui.painter();
@@ -896,7 +916,9 @@ fn trending_header(ui: &mut egui::Ui) {
 
     x += T_RANK;
     p.text(egui::pos2(x, cy), egui::Align2::LEFT_CENTER, "TOKEN", f.clone(), FAINT);
-    x += T_SYM + T_PRICE;
+    x += T_SYM;
+    p.text(egui::pos2(x, cy), egui::Align2::LEFT_CENTER, "DEX", f.clone(), FAINT);
+    x += T_DEX + T_PRICE;
     p.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, "PRICE", f.clone(), FAINT);
     x += T_CHG;
     p.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, "24H", f.clone(), FAINT);
@@ -941,12 +963,15 @@ fn trending_row(ui: &mut egui::Ui, i: usize, r: &trending::Row) -> bool {
     p.text(
         egui::pos2(x, cy),
         egui::Align2::LEFT_CENTER,
-        truncate(&r.symbol, 14),
+        truncate(&r.symbol, 12),
         FontId::proportional(13.5),
         FG,
     );
 
-    x += T_SYM + T_PRICE;
+    x += T_SYM;
+    dex_badge(p, egui::pos2(x, cy), &r.dex_id);
+
+    x += T_DEX + T_PRICE;
     p.text(
         egui::pos2(x, cy),
         egui::Align2::RIGHT_CENTER,
@@ -1049,6 +1074,15 @@ fn token_card(ui: &mut egui::Ui, info: &trending::Info, take: &str) {
             };
             ui.label(RichText::new(age).color(if h < 24.0 { ORANGE } else { FAINT }).small());
         }
+        // Which AMM this pool actually runs on — most of this chain is
+        // Uniswap, so this is the line that keeps the tool honest about what
+        // it is showing you.
+        let on_sushi = trending::is_sushi(&info.dex_id);
+        ui.label(
+            RichText::new(if on_sushi { "on Sushi".to_string() } else { info.dex_id.clone() })
+                .color(if on_sushi { ACCENT } else { FAINT })
+                .small(),
+        );
     });
     ui.add_space(4.0);
     ui.label(
