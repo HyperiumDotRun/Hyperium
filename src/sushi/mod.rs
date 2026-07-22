@@ -37,7 +37,8 @@ const ROW_HOVER: Color32 = Color32::from_rgb(34, 36, 41);
 /// through all three is a tour of everything the agent does. Written with bare
 /// tickers because the model resolves against the whitelist, and a starter that
 /// missed would teach the wrong lesson about what the agent accepts.
-const EXAMPLES: &[&str] = &["price of WETH", "1 WETH in USDG", "what's pumping"];
+const EXAMPLES: &[&str] =
+    &["price of WETH", "1 WETH in USDG", "what's pumping", "what's got good volume"];
 
 /// Phrases cycled while a request is in flight. They name the step actually
 /// under way, so the wait reads as work rather than as a hang.
@@ -70,6 +71,23 @@ Cite the actual figures you are reading. Personality doesn't excuse making numbe
 
 Never tell anyone to buy or sell this or any other token, never say a price will go up \
 or down, never call anything safe. You can roast a chart; you cannot recommend one.";
+
+/// Same voice and the same hard line as `TAKE_SYSTEM`, aimed at a list
+/// instead of one token — this is the one place in the whole tool that could
+/// most easily slide into "buy this one", so the rule is repeated rather than
+/// assumed to carry over.
+const SCREEN_SYSTEM: &str = "\
+You are looking at a list of tokens currently trading on Robinhood Chain, ranked by \
+24h volume, with age and DEX. Same board a screener would show. Same degen \
+crypto-twitter voice as anywhere else on this thing — not a research desk.
+
+Reply with two or three short sentences reacting to the *set*, not to one token: what \
+stands out — a brand-new pool already doing real volume, several names that look like \
+the same meme cycling, one that's clearly cooling off, how much of this is Uniswap vs \
+Sushi. Cite real figures from the list.
+
+Never say which one to buy, never rank them by which is the better trade, never call \
+anything safe. Describe the board. Do not pick a winner.";
 
 const DEFAULT_SLIPPAGE: f64 = 0.005;
 const LOG_MAX: usize = 20;
@@ -109,6 +127,9 @@ enum Outcome {
     Quote { chain: &'static str, quote: api::Quote },
     /// Feeds the table rather than the result card.
     Market { rows: Vec<market::Row>, sort: market::Sort, limit: usize },
+    /// A chat-requested read of the Robinhood Chain board — same data as the
+    /// always-visible table, plus a take on the set as a whole.
+    Screen { rows: Vec<trending::Row>, take: String },
 }
 
 /// What a completed swap actually did, re-read from the chain side rather
@@ -261,10 +282,42 @@ fn sushi_key_path(cfg: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Execute an already-resolved intent. No model involved past this point.
-fn run(intent: Intent, api_key: &str) -> Result<Outcome, String> {
+/// Flattens the board into the same fields it renders — symbol, price, 24h
+/// change, volume, age, DEX — so the model reads exactly what the table below
+/// its take will show, not a differently-shaped summary that could disagree
+/// with it.
+fn screen_brief(rows: &[trending::Row]) -> String {
+    let mut out = String::from("Robinhood Chain, ranked by 24h volume:\n");
+    for r in rows {
+        let age = r
+            .age_hours()
+            .map(|h| if h < 48.0 { format!("{h:.0}h old") } else { format!("{:.0}d old", h / 24.0) })
+            .unwrap_or_else(|| "age unknown".into());
+        let chg = r.change_h24.map(|c| format!("{c:+.1}%")).unwrap_or_else(|| "n/a".into());
+        out.push_str(&format!(
+            "- {} · ${} · 24h {} · vol ${:.0} · {} · {}\n",
+            r.symbol, r.price_usd, chg, r.volume_h24, age, r.dex_id
+        ));
+    }
+    out
+}
+
+fn run(intent: Intent, api_key: &str, ai_key: &str) -> Result<Outcome, String> {
     match intent {
         Intent::Market { sort, limit } => {
             Ok(Outcome::Market { rows: market::fetch(sort, limit)?, sort, limit })
+        }
+        Intent::ChainScreen { limit } => {
+            let rows = trending::fetch(limit)?;
+            let take = if ai_key.trim().is_empty() {
+                String::new()
+            } else {
+                use crate::llm::LlmProvider;
+                crate::llm::Anthropic::new(ai_key.to_string())
+                    .complete(SCREEN_SYSTEM, &screen_brief(&rows))
+                    .unwrap_or_else(|e| format!("(no read: {e})"))
+            };
+            Ok(Outcome::Screen { rows, take })
         }
         Intent::Price { chain, token } => {
             let usd = api::price(chain.id, token.address, api_key)?;
@@ -519,9 +572,9 @@ impl SushiTool {
         let api_key = self.sushi_key.clone();
         self.spawn(ctx, move || {
             use crate::llm::LlmProvider;
-            let raw =
-                crate::llm::Anthropic::new(ai_key).complete(&intent::system_prompt(), &question)?;
-            run(intent::parse(&raw)?, &api_key)
+            let raw = crate::llm::Anthropic::new(ai_key.clone())
+                .complete(&intent::system_prompt(), &question)?;
+            run(intent::parse(&raw)?, &api_key, &ai_key)
         });
     }
 
@@ -545,6 +598,9 @@ impl SushiTool {
             }
             Ok(Outcome::Token { info, .. }) => {
                 (format!("read {} on Robinhood Chain", info.symbol), true)
+            }
+            Ok(Outcome::Screen { rows, .. }) => {
+                (format!("screened {} Robinhood Chain tokens", rows.len()), true)
             }
             Err(e) => (e.clone(), false),
         };
@@ -1372,6 +1428,47 @@ fn short_addr(a: &str) -> String {
 /// The four percentages sit side by side on purpose: a token up on the day and
 /// down on the hour is a different story from one up on both, and that contrast
 /// is invisible when the windows are shown one at a time.
+/// A chat-requested read of the board: the same table the always-visible
+/// section shows, plus a take on the set as a whole. Rows are display-only
+/// here — the persistent board below is where a row turns into a lookup.
+fn screen_card(ui: &mut egui::Ui, rows: &[trending::Row], take: &str) {
+    ui.label(
+        RichText::new(format!("ROBINHOOD CHAIN · {} tokens · by 24h volume", rows.len()))
+            .color(ACCENT)
+            .small()
+            .strong(),
+    );
+    ui.add_space(8.0);
+
+    if rows.is_empty() {
+        ui.label(RichText::new("nothing trading right now").color(FAINT).small());
+        return;
+    }
+
+    trending_header(ui);
+    for (i, row) in rows.iter().enumerate() {
+        trending_row(ui, i, row);
+    }
+
+    if !take.is_empty() {
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("◆").color(ACCENT).small());
+            ui.label(RichText::new("THE AGENT'S HOT TAKE").color(ACCENT).small().strong());
+        });
+        ui.add_space(6.0);
+        ui.label(RichText::new(take).color(FG));
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Reacting to the board above, not a signal — it will never tell you which one to trade.")
+                .color(FAINT)
+                .small(),
+        );
+    }
+}
+
 struct SwapAction {
     token_out: String,
     symbol: String,
@@ -1599,6 +1696,7 @@ fn result_card(ui: &mut egui::Ui, outcome: &Outcome) {
             // this function isn't given) — rendering nothing for either here
             // keeps both invariants instead of panicking on them.
             Outcome::Market { .. } | Outcome::Token { .. } => {}
+            Outcome::Screen { rows, take } => screen_card(ui, rows, take),
             Outcome::Price { chain, symbol, address, usd } => {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(symbol).color(FG).strong());

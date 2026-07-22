@@ -9,10 +9,22 @@ use serde_json::Value;
 use super::market;
 use super::tokens::{self, Chain, Token};
 
+/// Robinhood Chain's own board, upper-bounded the same way the board's own
+/// refresh button is (`trending::fetch` clamps again regardless, but a
+/// model-stated limit shouldn't even reach it looking unbounded).
+pub const SCREEN_LIMIT_MAX: usize = 30;
+
 #[derive(Debug)]
 pub enum Intent {
     Market {
         sort: market::Sort,
+        limit: usize,
+    },
+    /// What's actually trading on Robinhood Chain right now — a chat-shaped
+    /// door into the same data the always-visible board already shows.
+    /// Distinct from `Market`: that one is the whole crypto market via
+    /// CoinGecko, this one is this chain's own pools via Dexscreener.
+    ChainScreen {
         limit: usize,
     },
     Price {
@@ -35,6 +47,7 @@ pub fn system_prompt() -> String {
 the JSON only — no prose, no code fence.\n\n\
 Shapes:\n\
   {{\"action\":\"market\",\"sort\":\"volume|market_cap|gainers|losers\",\"limit\":10}}\n\
+  {{\"action\":\"screen\",\"limit\":20}}\n\
   {{\"action\":\"price\",\"chain\":\"<chain>\",\"token\":\"<symbol>\"}}\n\
   {{\"action\":\"quote\",\"chain\":\"<chain>\",\"tokenIn\":\"<symbol>\",\
 \"tokenOut\":\"<symbol>\",\"amount\":\"<decimal>\"}}\n\
@@ -47,6 +60,11 @@ refusing. Default to sort \"volume\" and limit 10 when unstated; map \
 \"biggest/top/most traded\" to volume, \"largest/biggest coins\" to market_cap, \
 \"pumping/up the most/best performers\" to gainers, \"dumping/down the most/worst\" \
 to losers. limit is at most 50.\n\n\
+Use \"screen\" instead of \"market\" only when the question is specifically about \
+Robinhood Chain itself — \"on Robinhood\", \"this chain\", \"what just launched\", \
+\"new tokens\", \"good volume here/on-chain\". \"market\" is the whole crypto \
+market; \"screen\" is only what is actually trading on this one chain right now. \
+Default limit 20 when unstated; at most 30.\n\n\
 Use \"price\" only for one specific token's value, and \"quote\" only to convert a \
 stated amount of one token into another. Both are restricted to these chains \
 and symbols:\n{}\n\
@@ -99,6 +117,11 @@ pub fn parse(raw: &str) -> Result<Intent, String> {
             let limit = v["limit"].as_u64().unwrap_or(10).clamp(1, market::LIMIT_MAX as u64);
             Ok(Intent::Market { sort, limit: limit as usize })
         }
+        "screen" => {
+            let limit =
+                v["limit"].as_u64().unwrap_or(20).clamp(1, SCREEN_LIMIT_MAX as u64);
+            Ok(Intent::ChainScreen { limit: limit as usize })
+        }
         "price" => {
             let chain = chain_of(&v)?;
             let token = token_of(chain, &v, "token")?;
@@ -146,6 +169,17 @@ mod tests {
         assert_eq!(token_in.symbol, "ETH");
         assert_eq!(token_out.symbol, "USDC");
         assert_eq!(amount_raw, 500_000_000_000_000_000);
+    }
+
+    #[test]
+    fn parses_a_chain_screen_and_clamps_its_limit() {
+        let i = parse(r#"{"action":"screen","limit":9999}"#).unwrap();
+        let Intent::ChainScreen { limit } = i else { panic!("expected a screen") };
+        assert_eq!(limit, SCREEN_LIMIT_MAX);
+
+        let i = parse(r#"{"action":"screen"}"#).unwrap();
+        let Intent::ChainScreen { limit } = i else { panic!("expected a screen") };
+        assert_eq!(limit, 20);
     }
 
     #[test]
