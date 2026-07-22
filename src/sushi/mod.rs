@@ -78,13 +78,17 @@ or down, never call anything safe. You can roast a chart; you cannot recommend o
 /// assumed to carry over.
 const SCREEN_SYSTEM: &str = "\
 You are looking at a list of tokens currently trading on Robinhood Chain, ranked by \
-24h volume, with age and DEX. Same board a screener would show. Same degen \
-crypto-twitter voice as anywhere else on this thing — not a research desk.
+24h volume. For each: price, 1h and 24h price change, 1h/6h/24h volume, 24h buy/sell \
+counts, market cap, pool age, and which DEX. Same board a screener would show. Same \
+degen crypto-twitter voice as anywhere else on this thing — not a research desk.
 
-Reply with two or three short sentences reacting to the *set*, not to one token: what \
-stands out — a brand-new pool already doing real volume, several names that look like \
-the same meme cycling, one that's clearly cooling off, how much of this is Uniswap vs \
-Sushi. Cite real figures from the list.
+Reply with two or three short sentences reacting to the *set*, not to one token. Use \
+the windows to say something the 24h number alone can't: a token with big 24h volume \
+but almost nothing in the 1h column has gone quiet; one where 1h volume is a large \
+share of 24h is heating up right now. A buy/sell split that's lopsided vs one that's \
+even tells a different story at the same volume. Also worth a line: a brand-new pool \
+already doing real volume, several names that look like the same meme cycling, how \
+much of this is Uniswap vs Sushi. Cite real figures from the list.
 
 Never say which one to buy, never rank them by which is the better trade, never call \
 anything safe. Describe the board. Do not pick a winner.";
@@ -113,10 +117,15 @@ const T_SYM: f32 = 108.0;
 const T_DEX: f32 = 86.0;
 const T_PRICE: f32 = 120.0;
 const T_CHG: f32 = 100.0;
+// Two volume windows rather than one: 24h alone can't tell a token that's
+// gone quiet from one heating up right now, and that distinction is the
+// whole point of a screener over a static leaderboard.
+const T_VOL1H: f32 = 100.0;
 const T_VOL: f32 = 112.0;
 const T_LIQ: f32 = 108.0;
 const T_AGE: f32 = 66.0;
-const T_TABLE_W: f32 = T_RANK + T_SYM + T_DEX + T_PRICE + T_CHG + T_VOL + T_LIQ + T_AGE;
+const T_TABLE_W: f32 =
+    T_RANK + T_SYM + T_DEX + T_PRICE + T_CHG + T_VOL1H + T_VOL + T_LIQ + T_AGE;
 
 enum Outcome {
     Price { chain: &'static str, symbol: String, address: String, usd: f64 },
@@ -385,10 +394,23 @@ fn screen_brief(rows: &[trending::Row]) -> String {
             .age_hours()
             .map(|h| if h < 48.0 { format!("{h:.0}h old") } else { format!("{:.0}d old", h / 24.0) })
             .unwrap_or_else(|| "age unknown".into());
-        let chg = r.change_h24.map(|c| format!("{c:+.1}%")).unwrap_or_else(|| "n/a".into());
+        let pct = |c: Option<f64>| c.map(|c| format!("{c:+.1}%")).unwrap_or_else(|| "n/a".into());
+        let mcap = r.market_cap.map(|m| format!("${m:.0}")).unwrap_or_else(|| "n/a".into());
         out.push_str(&format!(
-            "- {} · ${} · 24h {} · vol ${:.0} · {} · {}\n",
-            r.symbol, r.price_usd, chg, r.volume_h24, age, r.dex_id
+            "- {} · ${} · chg 1h {} / 24h {} · vol 1h ${:.0} / 6h ${:.0} / 24h ${:.0} · \
+             buys/sells 24h {}/{} · mcap {} · {} · {}\n",
+            r.symbol,
+            r.price_usd,
+            pct(r.change_h1),
+            pct(r.change_h24),
+            r.volume_h1,
+            r.volume_h6,
+            r.volume_h24,
+            r.buys_h24,
+            r.sells_h24,
+            mcap,
+            age,
+            r.dex_id
         ));
     }
     out
@@ -1418,8 +1440,10 @@ fn trending_header(ui: &mut egui::Ui) {
     p.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, "PRICE", f.clone(), FAINT);
     x += T_CHG;
     p.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, "24H", f.clone(), FAINT);
+    x += T_VOL1H;
+    p.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, "VOL 1H", f.clone(), FAINT);
     x += T_VOL;
-    p.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, "VOLUME 24H", f.clone(), FAINT);
+    p.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, "VOL 24H", f.clone(), FAINT);
     x += T_LIQ;
     p.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, "LIQUIDITY", f.clone(), FAINT);
     x += T_AGE;
@@ -1484,6 +1508,20 @@ fn trending_row(ui: &mut egui::Ui, i: usize, r: &trending::Row) -> bool {
         None => ("—".to_string(), FAINT),
     };
     p.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, chg_text, num.clone(), chg_color);
+
+    x += T_VOL1H;
+    // Flat 24h activity spread evenly would put ~4.2% of it in any given
+    // hour; well above that means the last hour is carrying more than its
+    // share — accent it, since that's the token actually moving right now
+    // rather than one coasting on a volume spike from hours ago.
+    let heating = r.volume_h24 > 0.0 && r.volume_h1 > r.volume_h24 * 0.15;
+    p.text(
+        egui::pos2(x, cy),
+        egui::Align2::RIGHT_CENTER,
+        market::money_compact(r.volume_h1),
+        num.clone(),
+        if heating { ORANGE } else { DIM },
+    );
 
     x += T_VOL;
     p.text(

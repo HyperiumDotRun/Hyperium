@@ -55,8 +55,19 @@ pub struct Row {
     pub price_usd: f64,
     /// Percent, already signed. Absent when the pair is too young to have one.
     pub change_h24: Option<f64>,
+    pub change_h1: Option<f64>,
     pub volume_h24: f64,
+    /// The window that actually says whether this is heating up right now —
+    /// 24h volume alone can't tell a token that traded hard six hours ago and
+    /// has gone quiet since from one that's moving this minute.
+    pub volume_h1: f64,
+    pub volume_h6: f64,
     pub liquidity_usd: f64,
+    pub market_cap: Option<f64>,
+    /// Buy/sell pressure over 24h — volume says how much moved, this says
+    /// which direction the crowd leaned while it did.
+    pub buys_h24: u64,
+    pub sells_h24: u64,
     /// Pool creation, epoch ms. Age is what tells a fresh launch from a
     /// survivor, and it is the column a curated list can never have.
     pub created_at_ms: Option<u64>,
@@ -312,13 +323,20 @@ fn rank(raw: &[Value], limit: usize) -> Vec<Row> {
             continue;
         }
         let volume_h24 = num(&p["volume"]["h24"]).unwrap_or(0.0);
+        let txns24 = &p["txns"]["h24"];
         let row = Row {
             symbol: symbol.to_string(),
             address: address.to_string(),
             price_usd: num(&p["priceUsd"]).unwrap_or(0.0),
             change_h24: num(&p["priceChange"]["h24"]),
+            change_h1: num(&p["priceChange"]["h1"]),
             volume_h24,
+            volume_h1: num(&p["volume"]["h1"]).unwrap_or(0.0),
+            volume_h6: num(&p["volume"]["h6"]).unwrap_or(0.0),
             liquidity_usd: num(&p["liquidity"]["usd"]).unwrap_or(0.0),
+            market_cap: num(&p["marketCap"]),
+            buys_h24: txns24["buys"].as_u64().unwrap_or(0),
+            sells_h24: txns24["sells"].as_u64().unwrap_or(0),
             created_at_ms: p["pairCreatedAt"].as_u64(),
             dex_id: p["dexId"].as_str().unwrap_or("unknown").to_string(),
         };
@@ -346,13 +364,27 @@ mod tests {
         json!({
             "baseToken": { "symbol": sym, "address": addr },
             "priceUsd": "0.0001",
-            "priceChange": { "h24": 12.5 },
-            "volume": { "h24": vol },
+            "priceChange": { "h24": 12.5, "h1": 3.1 },
+            "volume": { "h24": vol, "h1": vol / 10.0, "h6": vol / 2.0 },
             "liquidity": { "usd": 1000.0 },
+            "marketCap": 50_000.0,
+            "txns": { "h24": { "buys": 40, "sells": 25 } },
             "pairCreatedAt": 1_700_000_000_000u64,
             "url": "https://dexscreener.com/robinhood/x",
             "dexId": "uniswap"
         })
+    }
+
+    #[test]
+    fn reads_the_full_set_of_windows_and_pressure() {
+        let raw = vec![pair("X", "0xx", 1000.0)];
+        let row = &rank(&raw, 10)[0];
+        assert_eq!(row.volume_h1, 100.0);
+        assert_eq!(row.volume_h6, 500.0);
+        assert_eq!(row.change_h1, Some(3.1));
+        assert_eq!(row.market_cap, Some(50_000.0));
+        assert_eq!(row.buys_h24, 40);
+        assert_eq!(row.sells_h24, 25);
     }
 
     #[test]
