@@ -187,6 +187,46 @@ impl Outcome {
     }
 }
 
+/// A written line for the turn, not just a data card underneath it — this is
+/// the difference between a widget and a chat message. Built in Rust from the
+/// numbers already fetched, never a separate model call: Price/Quote/Market
+/// are simple enough to phrase deterministically, and doing it this way means
+/// the sentence cannot possibly disagree with the card below it. Token and
+/// Screen already carry a written line of their own — the model's take — so
+/// this returns empty for both rather than saying the same thing twice.
+fn chat_reply(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Price { chain, symbol, usd, .. } => {
+            format!("{symbol} is at {} on {chain}.", market::money_price(*usd))
+        }
+        Outcome::Quote { chain, quote } => {
+            let (sent, got) = Outcome::legs(quote);
+            match quote.status.as_str() {
+                "Success" => format!(
+                    "{sent} {} gets you about {got} {} on {chain}.",
+                    quote.token_in.symbol, quote.token_out.symbol
+                ),
+                "Partial" => format!(
+                    "Only a partial route for {sent} {} → {} on {chain} — about {got} of \
+                     what was asked for.",
+                    quote.token_in.symbol, quote.token_out.symbol
+                ),
+                other => format!("{other} on {chain} for that pair."),
+            }
+        }
+        Outcome::Market { rows, sort, limit } => match rows.first() {
+            Some(top) => format!(
+                "Top {limit} by {} — {} leads at {}.",
+                sort.label(),
+                top.symbol,
+                market::money_price(top.price)
+            ),
+            None => "Nothing came back for that.".to_string(),
+        },
+        Outcome::Token { .. } | Outcome::Screen { .. } => String::new(),
+    }
+}
+
 struct LogLine {
     at: Instant,
     text: String,
@@ -681,18 +721,13 @@ impl SushiTool {
                 Ok(outcome) => {
                     self.record(&outcome);
                     let question = self.pending_question.take().unwrap_or_default();
-                    // A market intent updates the persistent table below and
-                    // says nothing in the thread; everything else becomes a
-                    // turn — that split predates the chat history and is
-                    // unchanged by it.
+                    // Every intent becomes a turn, market included — a chat
+                    // question should answer in the chat, not update a board
+                    // somewhere else on the page and say nothing about it.
+                    // The standalone MARKET section below still exists and
+                    // still refreshes on its own; asking through chat no
+                    // longer reaches into it.
                     match outcome {
-                        Ok(Outcome::Market { rows, sort, limit }) => {
-                            self.market = rows;
-                            self.market_sort = sort;
-                            self.market_limit = limit;
-                            self.market_err = None;
-                            self.market_at = Some(Instant::now());
-                        }
                         Ok(o) => self.chat.push(ChatTurn { question, answer: ChatAnswer::Result(o) }),
                         Err(e) => self.chat.push(ChatTurn { question, answer: ChatAnswer::Error(e) }),
                     }
@@ -1079,6 +1114,15 @@ impl SushiTool {
             ui.add_space(if i == 0 { 0.0 } else { 14.0 });
             ui.label(RichText::new(&turn.question).color(DIM).strong());
             ui.add_space(4.0);
+            // The written line first, chat-message style — Token/Screen's own
+            // take fills this role instead, so nothing doubles up.
+            if let ChatAnswer::Result(outcome) = &turn.answer {
+                let reply = chat_reply(outcome);
+                if !reply.is_empty() {
+                    ui.label(RichText::new(reply).color(FG));
+                    ui.add_space(6.0);
+                }
+            }
             match &turn.answer {
                 ChatAnswer::Result(Outcome::Token { info, take }) => {
                     let interactive = i == last_idx;
@@ -1787,11 +1831,22 @@ fn result_card(ui: &mut egui::Ui, outcome: &Outcome) {
         .corner_radius(12.0)
         .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| match outcome {
-            // Market is routed to the table in `poll`, and Token is rendered
-            // by `agent_section` directly (it needs the wallet and swap state
-            // this function isn't given) — rendering nothing for either here
-            // keeps both invariants instead of panicking on them.
-            Outcome::Market { .. } | Outcome::Token { .. } => {}
+            // Token is rendered by `agent_section` directly (it needs the
+            // wallet and swap state this function isn't given) — rendering
+            // nothing here keeps that invariant instead of panicking on it.
+            Outcome::Token { .. } => {}
+            Outcome::Market { rows, sort, limit } => {
+                ui.label(
+                    RichText::new(format!("top {limit} · {}", sort.label()))
+                        .color(FAINT)
+                        .small(),
+                );
+                ui.add_space(6.0);
+                table_header(ui);
+                for (i, row) in rows.iter().enumerate() {
+                    market_row(ui, i, row);
+                }
+            }
             Outcome::Screen { rows, take } => screen_card(ui, rows, take),
             Outcome::Price { chain, symbol, address, usd } => {
                 ui.horizontal(|ui| {
