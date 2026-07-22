@@ -7,10 +7,12 @@
 //! or broadcast a transaction.
 
 mod api;
+mod erc20;
 mod trending;
 mod intent;
 mod market;
 mod tokens;
+mod wallet;
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -104,6 +106,50 @@ enum Outcome {
     Market { rows: Vec<market::Row>, sort: market::Sort, limit: usize },
 }
 
+/// What a completed swap actually did, re-read from the chain side rather
+/// than assumed from the request — `sent`/`got_symbol` describe the leg that
+/// was signed, not the one that was asked for.
+struct SwapDone {
+    tx_hash: String,
+    sent: String,
+    got_symbol: String,
+    /// What the route promised before it was sent, not what actually landed —
+    /// this build has no way to read the receipt's real output amount without
+    /// decoding event logs, so it shows the figure it can stand behind rather
+    /// than a real one it would have to guess at.
+    expected_out: String,
+    price_impact: Option<f64>,
+}
+
+/// Every step a swap passes through, in order. Threaded back to the UI via
+/// `Arc<Mutex<SwapStep>>` rather than the channel, because the channel only
+/// carries a final result and this needs to update mid-flight, while Frame's
+/// window has the user's attention.
+#[derive(Clone, PartialEq)]
+enum SwapStep {
+    Idle,
+    Quoting,
+    CheckingAllowance,
+    /// Frame is open waiting on the user; this is the step that can least
+    /// afford to look like the app has frozen.
+    WaitingOnApproval,
+    ConfirmingApproval,
+    WaitingOnSwap,
+}
+
+impl SwapStep {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Idle => "",
+            Self::Quoting => "asking Sushi for a route",
+            Self::CheckingAllowance => "checking allowance",
+            Self::WaitingOnApproval => "waiting for approval in Frame",
+            Self::ConfirmingApproval => "confirming the approval on-chain",
+            Self::WaitingOnSwap => "waiting for the swap in Frame",
+        }
+    }
+}
+
 impl Outcome {
     /// Both legs re-derived from the API's own numbers rather than from what we
     /// asked for — if the two ever disagree, the display should show the truth.
@@ -148,6 +194,24 @@ pub struct SushiTool {
     trending_rx: Option<Receiver<Result<Vec<trending::Row>, String>>>,
     trending_err: Option<String>,
     trending_at: Option<Instant>,
+
+    /// Frame's connected account. `None` covers both "never asked" and
+    /// "Frame isn't running" — the swap button's own click handler is what
+    /// distinguishes them, by trying to connect.
+    wallet: Option<String>,
+    wallet_connecting: bool,
+    wallet_err: Option<String>,
+    wallet_rx: Option<Receiver<Result<String, String>>>,
+    /// How much of the base token (WETH) to put into the swap, as the user
+    /// typed it — parsed against WETH's decimals only when the button is
+    /// pressed, same as the quote box's amount field.
+    swap_amount: String,
+    swap_rx: Option<Receiver<Result<SwapDone, String>>>,
+    swap_result: Option<Result<SwapDone, String>>,
+    /// Updated from the worker thread mid-flight; read by the UI thread every
+    /// frame. Not a channel: a channel only delivers once the whole job ends,
+    /// and this exists specifically to show what's happening before then.
+    swap_step: std::sync::Arc<std::sync::Mutex<SwapStep>>,
 }
 
 impl Default for SushiTool {
@@ -174,6 +238,15 @@ impl Default for SushiTool {
             trending_rx: None,
             trending_err: None,
             trending_at: None,
+
+            wallet: None,
+            wallet_connecting: false,
+            wallet_err: None,
+            wallet_rx: None,
+            swap_amount: "0.01".into(),
+            swap_rx: None,
+            swap_result: None,
+            swap_step: std::sync::Arc::new(std::sync::Mutex::new(SwapStep::Idle)),
         }
     }
 }
@@ -213,6 +286,89 @@ fn run(intent: Intent, api_key: &str) -> Result<Outcome, String> {
     }
 }
 
+/// Approvals typically land in one or two blocks; five minutes is generous
+/// headroom for a slow one without leaving the UI waiting indefinitely on a
+/// stuck one.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+/// "Infinite" approval — the standard practice so the same token doesn't ask
+/// to be approved again on the next swap. The user sees exactly this amount
+/// named in Frame's own confirmation before it's signed.
+const MAX_APPROVAL: u128 = u128::MAX;
+
+/// The whole swap sequence, off the UI thread. Every step that could fail is
+/// reported through `Result`; every step that needs the user is a call into
+/// `wallet::`, which is the only place a signature can happen.
+#[allow(clippy::too_many_arguments)]
+fn run_swap_job(
+    chain_id: u64,
+    token_in: &str,
+    token_out: &str,
+    amount_in: u128,
+    sender: &str,
+    api_key: &str,
+    symbol: String,
+    set_step: impl Fn(SwapStep),
+) -> Result<SwapDone, String> {
+    set_step(SwapStep::Quoting);
+    let swap = api::swap(
+        &api::SwapRequest {
+            chain_id,
+            token_in: token_in.to_string(),
+            token_out: token_out.to_string(),
+            amount: amount_in,
+            max_slippage: DEFAULT_SLIPPAGE,
+            sender: sender.to_string(),
+        },
+        api_key,
+    )?;
+    if swap.status == "Partial" {
+        // Not fatal — Sushi found a route that fills less than the full
+        // amount — but worth surfacing rather than silently swapping less
+        // than the user typed.
+    }
+
+    // The native token needs no allowance — there is nothing to approve
+    // spending, since it moves as `value`, not as an ERC-20 transfer.
+    let is_native = token_in.eq_ignore_ascii_case(tokens::NATIVE);
+    if !is_native {
+        set_step(SwapStep::CheckingAllowance);
+        let call_data = erc20::encode_allowance(sender, &swap.tx.to)?;
+        let raw = wallet::call(chain_id, token_in, &call_data)?;
+        let current = erc20::decode_uint256(&raw);
+
+        if current < amount_in {
+            set_step(SwapStep::WaitingOnApproval);
+            let approve_data = erc20::encode_approve(&swap.tx.to, MAX_APPROVAL)?;
+            let approve_hash = wallet::send_transaction(&wallet::TxRequest {
+                chain_id,
+                from: sender.to_string(),
+                to: token_in.to_string(),
+                data: approve_data,
+                value: 0,
+            })?;
+            set_step(SwapStep::ConfirmingApproval);
+            wallet::wait_for_receipt(chain_id, &approve_hash, APPROVAL_TIMEOUT)?;
+        }
+    }
+
+    set_step(SwapStep::WaitingOnSwap);
+    let tx_hash = wallet::send_transaction(&wallet::TxRequest {
+        chain_id,
+        from: sender.to_string(),
+        to: swap.tx.to.clone(),
+        data: swap.tx.data.clone(),
+        value: swap.tx.value,
+    })?;
+
+    Ok(SwapDone {
+        tx_hash,
+        sent: tokens::format_units(swap.amount_in, swap.token_in.decimals),
+        expected_out: tokens::format_units(swap.amount_out, swap.token_out.decimals),
+        price_impact: swap.price_impact,
+        got_symbol: if symbol.is_empty() { swap.token_out.symbol } else { symbol },
+    })
+}
+
 impl SushiTool {
     fn spawn(
         &mut self,
@@ -250,6 +406,73 @@ impl SushiTool {
             let _ = tx.send(trending::fetch(TRENDING_ROWS));
         });
         self.trending_rx = Some(rx);
+        ctx.request_repaint();
+    }
+
+    /// Asks Frame for the connected account. Runs on a worker thread since
+    /// Frame may prompt the user and the reply can take a while — the same
+    /// reason every other network call in this file is threaded. Its own
+    /// channel rather than reusing `self.rx`: connecting is not an `Outcome`,
+    /// and this way a wallet error can never land in a ticker lookup's card.
+    fn connect_wallet(&mut self, ctx: &egui::Context) {
+        if self.wallet_connecting {
+            return;
+        }
+        self.wallet_connecting = true;
+        self.wallet_err = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(wallet::accounts());
+        });
+        self.wallet_rx = Some(rx);
+        ctx.request_repaint();
+    }
+
+    /// The whole swap, start to finish, on one worker thread: quote, allowance
+    /// check, an approval if one is needed (with a wait for it to actually be
+    /// mined before the next step trusts it), then the swap itself. Every
+    /// signature happens inside Frame's own window — this thread only ever
+    /// asks, it never holds a key.
+    fn run_swap(&mut self, symbol: String, token_out_address: String, ctx: &egui::Context) {
+        if self.swap_rx.is_some() {
+            return;
+        }
+        let Some(sender) = self.wallet.clone() else { return };
+        let Some(robinhood) = tokens::chain_by_name(trending::CHAIN_NAME) else { return };
+        let Some(weth) = robinhood.token("WETH") else { return };
+        let amount_raw = match tokens::parse_units(self.swap_amount.trim(), weth.decimals) {
+            Ok(0) => {
+                self.swap_result = Some(Err("amount is zero".into()));
+                return;
+            }
+            Ok(v) => v,
+            Err(e) => {
+                self.swap_result = Some(Err(e));
+                return;
+            }
+        };
+
+        let chain_id = robinhood.id;
+        let token_in = weth.address.to_string();
+        let api_key = self.sushi_key.clone();
+        let step = self.swap_step.clone();
+        let set = move |s: SwapStep| *step.lock().unwrap() = s;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_swap_job(
+                chain_id,
+                &token_in,
+                &token_out_address,
+                amount_raw,
+                &sender,
+                &api_key,
+                symbol,
+                set,
+            ));
+        });
+        self.swap_rx = Some(rx);
+        self.swap_result = None;
         ctx.request_repaint();
     }
 
@@ -379,6 +602,40 @@ impl SushiTool {
                 }
                 Err(TryRecvError::Empty) => ui.ctx().request_repaint(),
                 Err(TryRecvError::Disconnected) => self.trending_rx = None,
+            }
+        }
+        if let Some(rx) = &self.wallet_rx {
+            match rx.try_recv() {
+                Ok(Ok(address)) => {
+                    self.wallet = Some(address);
+                    self.wallet_err = None;
+                    self.wallet_connecting = false;
+                    self.wallet_rx = None;
+                }
+                Ok(Err(e)) => {
+                    self.wallet_err = Some(e);
+                    self.wallet_connecting = false;
+                    self.wallet_rx = None;
+                }
+                Err(TryRecvError::Empty) => ui.ctx().request_repaint(),
+                Err(TryRecvError::Disconnected) => {
+                    self.wallet_connecting = false;
+                    self.wallet_rx = None;
+                }
+            }
+        }
+        if let Some(rx) = &self.swap_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    *self.swap_step.lock().unwrap() = SwapStep::Idle;
+                    self.swap_result = Some(result);
+                    self.swap_rx = None;
+                }
+                Err(TryRecvError::Empty) => ui.ctx().request_repaint(),
+                Err(TryRecvError::Disconnected) => {
+                    *self.swap_step.lock().unwrap() = SwapStep::Idle;
+                    self.swap_rx = None;
+                }
             }
         }
     }
@@ -575,16 +832,41 @@ impl SushiTool {
                 ui.label(
                     RichText::new(if busy { "working" } else { "ready" }).color(FAINT).small(),
                 );
+
+                // Right-aligned wallet status. Whether a swap is even offered
+                // downstream (in the token card) depends entirely on this.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    match (&self.wallet, self.wallet_connecting) {
+                        (Some(addr), _) => {
+                            ui.label(RichText::new(short_addr(addr)).color(UP).small());
+                            ui.label(RichText::new("●").color(UP).small());
+                        }
+                        (None, true) => {
+                            ui.add(egui::Spinner::new().size(12.0).color(FAINT));
+                            ui.label(RichText::new("connecting…").color(FAINT).small());
+                        }
+                        (None, false) => {
+                            if tool_button(ui, "Connect Frame", true) {
+                                let ctx = ui.ctx().clone();
+                                self.connect_wallet(&ctx);
+                            }
+                        }
+                    }
+                });
             });
             ui.add_space(3.0);
             ui.label(
                 RichText::new(
                     "Ask it anything about the chain, or drop a ticker and it reads the chart. \
-                     It only ever looks — it cannot spend.",
+                     It can also swap through Sushi — every transaction is confirmed in your \
+                     own Frame wallet, never signed here.",
                 )
                 .color(DIM)
                 .small(),
             );
+            if let Some(e) = &self.wallet_err {
+                ui.label(RichText::new(format!("✗ {e}")).color(RED).small());
+            }
             ui.add_space(12.0);
 
             // Ticker lookup first: it is the shortest path from "what is this
@@ -649,22 +931,43 @@ impl SushiTool {
         // While a request is out, the thinking line replaces the answer rather
         // than sitting beside a stale one — the panel should never show a fresh
         // spinner above an old number and let you mistake it for the new one.
+        let mut swap_action = None;
         if busy {
             thinking_line(ui, self.busy_since, t);
         } else {
             match &self.result {
+                Some(Ok(Outcome::Token { info, take })) => {
+                    let step = self.swap_step.lock().unwrap().clone();
+                    swap_action = token_card(
+                        ui,
+                        info,
+                        take,
+                        self.wallet.as_deref(),
+                        &mut self.swap_amount,
+                        self.swap_rx.is_some(),
+                        step.label(),
+                        &self.swap_result,
+                    );
+                }
                 Some(Ok(outcome)) => result_card(ui, outcome),
                 Some(Err(e)) => {
                     ui.label(RichText::new(format!("✗ {e}")).color(RED));
                 }
                 None => {
                     ui.label(
-                        RichText::new("Read-only. No transaction is ever built here.")
-                            .color(FAINT)
-                            .small(),
+                        RichText::new(
+                            "Nothing signs or sends on its own — a swap only ever starts \
+                             from a button you click, and only ever confirms in Frame.",
+                        )
+                        .color(FAINT)
+                        .small(),
                     );
                 }
             }
+        }
+        if let Some(action) = swap_action {
+            let ctx = ui.ctx().clone();
+            self.run_swap(action.symbol, action.token_out, &ctx);
         }
 
         if !self.log.is_empty() {
@@ -1053,12 +1356,36 @@ fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
 }
 
+/// `0x1234…abcd` — enough to recognise a wallet at a glance, none of it
+/// wasted on the middle 32 hex characters nobody reads.
+fn short_addr(a: &str) -> String {
+    if a.len() < 12 { a.to_string() } else { format!("{}…{}", &a[..6], &a[a.len() - 4..]) }
+}
+
 /// One token, read across every window the indexer gives.
 ///
 /// The four percentages sit side by side on purpose: a token up on the day and
 /// down on the hour is a different story from one up on both, and that contrast
 /// is invisible when the windows are shown one at a time.
-fn token_card(ui: &mut egui::Ui, info: &trending::Info, take: &str) {
+struct SwapAction {
+    token_out: String,
+    symbol: String,
+}
+
+/// Returns `Some` exactly when the swap button was just clicked — the caller
+/// is what actually starts the job, same split as `trending_row`'s click
+/// returning `bool` rather than reaching into `self` from inside the table.
+#[allow(clippy::too_many_arguments)]
+fn token_card(
+    ui: &mut egui::Ui,
+    info: &trending::Info,
+    take: &str,
+    wallet: Option<&str>,
+    swap_amount: &mut String,
+    swap_busy: bool,
+    swap_step: &str,
+    swap_result: &Option<Result<SwapDone, String>>,
+) -> Option<SwapAction> {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(&info.symbol).color(FG).font(FontId::proportional(20.0)).strong(),
@@ -1160,6 +1487,92 @@ fn token_card(ui: &mut egui::Ui, info: &trending::Info, take: &str) {
             );
         }
     });
+
+    // The swap block. Absent entirely without a connected wallet, rather than
+    // shown disabled — a greyed-out button invites clicking it to see what
+    // happens, and what happens should never be "nothing, silently".
+    let mut action = None;
+    if let Some(from) = wallet {
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("SWAP").color(ACCENT).small().strong());
+            ui.label(RichText::new(short_addr(from)).color(FAINT).small());
+        });
+        ui.add_space(6.0);
+
+        if swap_busy {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0).color(ACCENT));
+                ui.label(RichText::new(swap_step).color(FG));
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(swap_amount)
+                        .desired_width(70.0)
+                        .font(FontId::monospace(13.0)),
+                );
+                ui.label(RichText::new("WETH →").color(DIM));
+                ui.label(RichText::new(&info.symbol).color(FG).strong());
+                if tool_button(ui, "Swap", true) {
+                    action = Some(SwapAction {
+                        token_out: info.address.clone(),
+                        symbol: info.symbol.clone(),
+                    });
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Opens in Frame for you to review and confirm — nothing is sent from here.",
+                )
+                .color(FAINT)
+                .small(),
+            );
+        }
+
+        match swap_result {
+            Some(Ok(done)) => {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "✓ swapped {} WETH for ~{} {}",
+                        done.sent, done.expected_out, done.got_symbol
+                    ))
+                    .color(UP),
+                );
+                if let Some(pct) = done.price_impact {
+                    ui.label(
+                        RichText::new(format!("price impact {:.2}%", pct * 100.0))
+                            .color(if pct.abs() > 0.03 { ORANGE } else { FAINT })
+                            .small(),
+                    );
+                }
+                let url = format!("https://robinhoodchain.blockscout.com/tx/{}", done.tx_hash);
+                ui.hyperlink_to(
+                    RichText::new(format!("{} ↗", short_addr(&done.tx_hash)))
+                        .color(FAINT)
+                        .small()
+                        .font(FontId::monospace(11.0)),
+                    &url,
+                );
+            }
+            Some(Err(e)) => {
+                ui.add_space(8.0);
+                ui.label(RichText::new(format!("✗ {e}")).color(RED).small());
+            }
+            None => {}
+        }
+    } else {
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new("Connect Frame above to swap into this token.").color(FAINT).small(),
+        );
+    }
+
+    action
 }
 
 fn result_card(ui: &mut egui::Ui, outcome: &Outcome) {
@@ -1168,10 +1581,11 @@ fn result_card(ui: &mut egui::Ui, outcome: &Outcome) {
         .corner_radius(12.0)
         .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| match outcome {
-            // Routed to the table in `poll`, so it never reaches the card —
-            // rendering nothing keeps that invariant instead of panicking on it.
-            Outcome::Market { .. } => {}
-            Outcome::Token { info, take } => token_card(ui, info, take),
+            // Market is routed to the table in `poll`, and Token is rendered
+            // by `agent_section` directly (it needs the wallet and swap state
+            // this function isn't given) — rendering nothing for either here
+            // keeps both invariants instead of panicking on them.
+            Outcome::Market { .. } | Outcome::Token { .. } => {}
             Outcome::Price { chain, symbol, address, usd } => {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(symbol).color(FG).strong());

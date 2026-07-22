@@ -1,8 +1,10 @@
 //! Thin client over the hosted Sushi API (api.sushi.com).
 //!
-//! Read-only surface only: price and quote. `/swap` is deliberately absent —
-//! it returns signable calldata, and nothing in this build should be able to
-//! produce that.
+//! `price` and `quote` are pure reads. `swap` returns signable calldata, which
+//! is why this file alone cannot move anything: `swap` hands that calldata
+//! back to the caller as data, and only `wallet::send_transaction` — a request
+//! to Frame, which signs and broadcasts on the user's side — can turn it into
+//! an actual transaction. This module never sees a key.
 
 use std::time::Duration;
 
@@ -172,6 +174,87 @@ pub fn quote(req: &QuoteRequest, api_key: &str) -> Result<Quote, String> {
     })
 }
 
+/// A transaction as Sushi's router built it — unsigned, and going nowhere on
+/// its own. `data` is the actual calldata; nothing in this file can turn it
+/// into a broadcast transaction, only `wallet::send_transaction` can, and
+/// that requires the user's own approval inside Frame.
+pub struct Tx {
+    pub to: String,
+    pub data: String,
+    /// Base units of the chain's native token. Zero for a token-in swap;
+    /// nonzero only when `token_in` is the native sentinel.
+    pub value: u128,
+}
+
+pub struct Swap {
+    /// `Success`, `Partial` or `NoWay`.
+    pub status: String,
+    pub token_in: QuoteToken,
+    pub token_out: QuoteToken,
+    pub amount_in: u128,
+    pub amount_out: u128,
+    pub price_impact: Option<f64>,
+    pub tx: Tx,
+}
+
+pub struct SwapRequest {
+    pub chain_id: u64,
+    pub token_in: String,
+    pub token_out: String,
+    /// Raw base units, already resolved against the token's decimals.
+    pub amount: u128,
+    pub max_slippage: f64,
+    /// The connected wallet. Sushi's router needs it to size the route
+    /// correctly (it is the account the tokens will actually move from).
+    pub sender: String,
+}
+
+/// Same request shape as `quote`, plus `sender` and a route that comes back
+/// ready to sign rather than merely priced.
+pub fn swap(req: &SwapRequest, api_key: &str) -> Result<Swap, String> {
+    let url = format!("{BASE}/swap/v7/{}", req.chain_id);
+    let params = [
+        ("tokenIn", req.token_in.clone()),
+        ("tokenOut", req.token_out.clone()),
+        ("amount", req.amount.to_string()),
+        ("maxSlippage", req.max_slippage.to_string()),
+        ("sender", req.sender.clone()),
+    ];
+    let v = get(&url, &params, api_key)?;
+
+    let status = v["status"].as_str().unwrap_or("Unknown").to_string();
+    if status == "NoWay" {
+        return Err("no route found for this pair and amount".into());
+    }
+
+    let (Some(token_in), Some(token_out)) = (token_at(&v, "tokenFrom"), token_at(&v, "tokenTo"))
+    else {
+        return Err("unexpected response shape (no token data)".into());
+    };
+    let tx = &v["tx"];
+    let (Some(to), Some(data)) = (tx["to"].as_str(), tx["data"].as_str()) else {
+        return Err("response carried no transaction to sign".into());
+    };
+    // `value` comes back as a decimal string on a successful route, but as
+    // literal `0` (a JSON number) when there is none — read both rather than
+    // let the number case silently parse as zero-length and default wrong.
+    let value = tx["value"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| tx["value"].as_u64().map(u128::from))
+        .unwrap_or(0);
+
+    Ok(Swap {
+        status,
+        token_in,
+        token_out,
+        amount_in: amount_at(&v, "amountIn"),
+        amount_out: amount_at(&v, "assumedAmountOut"),
+        price_impact: v["priceImpact"].as_f64(),
+        tx: Tx { to: to.to_string(), data: data.to_string(), value },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +313,21 @@ mod tests {
         let v: Value =
             serde_json::from_str(r#"{"amountIn":"1234567890123456789"}"#).unwrap();
         assert_eq!(amount_at(&v, "amountIn"), 1_234_567_890_123_456_789);
+    }
+
+    fn tx_value(json: &str) -> u128 {
+        let tx: Value = serde_json::from_str(json).unwrap();
+        tx["value"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .or_else(|| tx["value"].as_u64().map(u128::from))
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn tx_value_reads_both_the_stringified_and_bare_zero_case() {
+        assert_eq!(tx_value(r#"{"value":"1000000000000000000"}"#), 1_000_000_000_000_000_000);
+        assert_eq!(tx_value(r#"{"value":0}"#), 0);
+        assert_eq!(tx_value(r#"{}"#), 0);
     }
 }
