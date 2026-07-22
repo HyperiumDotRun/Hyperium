@@ -19,11 +19,13 @@ const CHAIN: &str = "robinhood";
 /// The same chain as `CHAIN`, spelled the way `tokens::CHAINS` spells it.
 pub const CHAIN_NAME: &str = "Robinhood";
 
-/// Pairs are enumerated through their quote side: everything on this chain is
-/// priced in one of these two, so the union is effectively the whole board.
+/// Pairs are enumerated through their quote side. WETH and USDG cover most of
+/// the board; VIRTUAL is what a Virtuals bonding-curve launch pairs against,
+/// so a token's own first pool is often against this one, not the other two —
+/// without it, a freshly-launched project's own token would not appear here.
 /// Symbols rather than literals, resolved against the registry, so the
 /// addresses stay defined in exactly one place.
-const QUOTES: &[&str] = &["WETH", "USDG"];
+const QUOTES: &[&str] = &["WETH", "USDG", "VIRTUAL"];
 
 /// Dexscreener answers 403 to a request that arrives without a plausible
 /// User-Agent. Not documented anywhere; found by watching curl succeed where a
@@ -179,15 +181,20 @@ pub fn fetch(limit: usize) -> Result<Vec<Row>, String> {
 /// see a name scroll past. It is also ambiguous, so the busiest pair wins:
 /// on a permissionless chain a dozen tokens can share a symbol, and the one
 /// actually trading is the one being asked about.
-pub fn lookup(ticker: &str) -> Result<Info, String> {
-    let ticker = ticker.trim().trim_start_matches('$');
-    if ticker.is_empty() {
-        return Err("type a ticker first".into());
+pub fn lookup(query: &str) -> Result<Info, String> {
+    let query = query.trim().trim_start_matches('$');
+    if query.is_empty() {
+        return Err("type a ticker or paste a contract address".into());
     }
+    // A contract address is unambiguous, so it should match on address alone
+    // rather than fall through the symbol filter below and report nothing —
+    // the whole reason to accept one is that tickers collide and addresses
+    // don't.
+    let is_address = query.len() == 42 && query.starts_with("0x");
 
     let url = format!(
         "https://api.dexscreener.com/latest/dex/search?q={}",
-        urlencode(ticker)
+        urlencode(query)
     );
     let resp = agent()
         .get(&url)
@@ -205,18 +212,22 @@ pub fn lookup(ticker: &str) -> Result<Info, String> {
         .iter()
         .filter(|p| p["chainId"].as_str() == Some(CHAIN))
         .filter(|p| {
-            p["baseToken"]["symbol"].as_str().is_some_and(|s| s.eq_ignore_ascii_case(ticker))
+            if is_address {
+                p["baseToken"]["address"].as_str().is_some_and(|a| a.eq_ignore_ascii_case(query))
+            } else {
+                p["baseToken"]["symbol"].as_str().is_some_and(|s| s.eq_ignore_ascii_case(query))
+            }
         })
         .max_by(|a, b| {
             let va = num(&a["volume"]["h24"]).unwrap_or(0.0);
             let vb = num(&b["volume"]["h24"]).unwrap_or(0.0);
             va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
         })
-        .ok_or_else(|| format!("no {ticker} pool on Robinhood Chain"))?;
+        .ok_or_else(|| format!("no {query} pool on Robinhood Chain"))?;
 
     let txns = &best["txns"]["h24"];
     Ok(Info {
-        symbol: best["baseToken"]["symbol"].as_str().unwrap_or(ticker).to_string(),
+        symbol: best["baseToken"]["symbol"].as_str().unwrap_or(query).to_string(),
         name: best["baseToken"]["name"].as_str().unwrap_or_default().to_string(),
         address: best["baseToken"]["address"].as_str().unwrap_or_default().to_string(),
         price_usd: num(&best["priceUsd"]).unwrap_or(0.0),

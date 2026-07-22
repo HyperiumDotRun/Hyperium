@@ -55,6 +55,15 @@ pub const CHAINS: &[Chain] = &[
                 address: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
                 decimals: 6,
             },
+            // The third quote token launches actually route through: this is
+            // what a bonding-curve launch on Virtuals pairs against, so a
+            // freshly-launched project's own pool is usually against this, not
+            // WETH or USDG. See `trending::QUOTES`.
+            Token {
+                symbol: "VIRTUAL",
+                address: "0xc6911796042b15d7fa4f6cde69e245ddcd3d9c31",
+                decimals: 18,
+            },
             Token {
                 symbol: "NVDA",
                 address: "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec",

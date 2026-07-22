@@ -18,9 +18,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::{Color32, FontId, RichText};
 
-use crate::tools::{
-    ACCENT, BG_ELEVATED, DIM, FAINT, FG, RED, Tool, ToolCtx, pill_select, tool_button,
-};
+use crate::tools::{ACCENT, BG_ELEVATED, DIM, FAINT, FG, RED, Tool, ToolCtx, tool_button};
 
 use intent::Intent;
 
@@ -125,10 +123,6 @@ struct LogLine {
 pub struct SushiTool {
     ask: String,
     ticker: String,
-    chain_idx: usize,
-    in_idx: usize,
-    out_idx: usize,
-    amount: String,
     sushi_key: String,
     key_open: bool,
     loaded: bool,
@@ -160,10 +154,6 @@ impl Default for SushiTool {
         Self {
             ask: String::new(),
             ticker: String::new(),
-            chain_idx: 0,
-            in_idx: 0,
-            out_idx: 2,
-            amount: "1".into(),
             sushi_key: String::new(),
             key_open: false,
             loaded: false,
@@ -223,10 +213,6 @@ fn run(intent: Intent, api_key: &str) -> Result<Outcome, String> {
 }
 
 impl SushiTool {
-    fn chain(&self) -> &'static tokens::Chain {
-        &tokens::CHAINS[self.chain_idx.min(tokens::CHAINS.len() - 1)]
-    }
-
     fn spawn(
         &mut self,
         ctx: &egui::Context,
@@ -307,39 +293,6 @@ impl SushiTool {
             let raw =
                 crate::llm::Anthropic::new(ai_key).complete(&intent::system_prompt(), &question)?;
             run(intent::parse(&raw)?, &api_key)
-        });
-    }
-
-    /// Manual path: no model at all, the pills already are the intent.
-    fn quote_manual(&mut self, ctx: &egui::Context) {
-        let chain = self.chain();
-        let symbols = chain.symbols();
-        let (Some(sin), Some(sout)) =
-            (symbols.get(self.in_idx).copied(), symbols.get(self.out_idx).copied())
-        else {
-            return;
-        };
-        if sin == sout {
-            self.result = Some(Err("input and output token are the same".into()));
-            return;
-        }
-        let (Some(token_in), Some(token_out)) = (chain.token(sin), chain.token(sout)) else {
-            return;
-        };
-        let amount_raw = match tokens::parse_units(self.amount.trim(), token_in.decimals) {
-            Ok(0) => {
-                self.result = Some(Err("amount is zero".into()));
-                return;
-            }
-            Ok(v) => v,
-            Err(e) => {
-                self.result = Some(Err(e));
-                return;
-            }
-        };
-        let api_key = self.sushi_key.clone();
-        self.spawn(ctx, move || {
-            run(Intent::Quote { chain, token_in, token_out, amount_raw }, &api_key)
         });
     }
 
@@ -692,41 +645,6 @@ impl SushiTool {
             self.ai_key_setup(ui, octx);
         }
         ui.add_space(14.0);
-
-        ui.label(RichText::new("or pick the pair yourself").color(FAINT).small());
-        ui.add_space(6.0);
-        let names: Vec<&str> = tokens::CHAINS.iter().map(|c| c.name).collect();
-        let before = self.chain_idx;
-        pill_select(ui, &names, &mut self.chain_idx);
-        if self.chain_idx != before {
-            let n = self.chain().tokens.len();
-            self.in_idx = self.in_idx.min(n - 1);
-            self.out_idx = self.out_idx.min(n - 1);
-        }
-        ui.add_space(10.0);
-
-        let symbols = self.chain().symbols();
-        ui.label(RichText::new("from").color(FAINT).small());
-        pill_select(ui, &symbols, &mut self.in_idx);
-        ui.add_space(2.0);
-        ui.label(RichText::new("to").color(FAINT).small());
-        pill_select(ui, &symbols, &mut self.out_idx);
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.amount)
-                    .hint_text("amount")
-                    .desired_width(110.0),
-            );
-            if tool_button(ui, "Quote", !busy) && !busy {
-                let ctx = ui.ctx().clone();
-                self.quote_manual(&ctx);
-            }
-            if busy {
-                ui.add(egui::Spinner::new().size(16.0).color(ACCENT));
-            }
-        });
-        ui.add_space(12.0);
 
         // While a request is out, the thinking line replaces the answer rather
         // than sitting beside a stale one — the panel should never show a fresh
