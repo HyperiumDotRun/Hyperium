@@ -5,13 +5,13 @@ use egui::{Color32, FontFamily, FontId, RichText, Stroke};
 
 use crate::doctor::{self, MachineReport};
 
-const FG: Color32 = Color32::from_rgb(224, 226, 230);
-const DIM: Color32 = Color32::from_rgb(122, 126, 136);
-const FAINT: Color32 = Color32::from_rgb(78, 81, 90);
-const ACCENT: Color32 = Color32::from_rgb(178, 232, 44);
+pub(crate) const FG: Color32 = Color32::from_rgb(224, 226, 230);
+pub(crate) const DIM: Color32 = Color32::from_rgb(122, 126, 136);
+pub(crate) const FAINT: Color32 = Color32::from_rgb(78, 81, 90);
+pub(crate) const ACCENT: Color32 = Color32::from_rgb(178, 232, 44);
 const ACCENT_DIM: Color32 = Color32::from_rgb(120, 150, 40);
-const RED: Color32 = Color32::from_rgb(226, 92, 92);
-const BG_ELEVATED: Color32 = Color32::from_rgb(26, 27, 31);
+pub(crate) const RED: Color32 = Color32::from_rgb(226, 92, 92);
+pub(crate) const BG_ELEVATED: Color32 = Color32::from_rgb(26, 27, 31);
 const BG_HOVER: Color32 = Color32::from_rgb(34, 36, 41);
 
 pub struct ToolCtx<'a> {
@@ -31,6 +31,7 @@ pub trait Tool {
 
 pub const BUILTIN: &[(&str, &str)] = &[
     ("genai", "Mirage"),
+    ("sushi", "Sushi agent"),
     ("memory", "Memory"),
     ("cheats", "Command memo"),
     ("health", "Health log"),
@@ -42,6 +43,7 @@ pub const BUILTIN: &[(&str, &str)] = &[
 pub fn make_tool(id: &str) -> Option<Box<dyn Tool>> {
     match id {
         "genai" => Some(Box::<GenAiTool>::default()),
+        "sushi" => Some(Box::<crate::sushi::SushiTool>::default()),
         "memory" => Some(Box::<MemoryTool>::default()),
         "cheats" => Some(Box::<CommandMemoTool>::default()),
         "health" => Some(Box::<HealthLogTool>::default()),
@@ -311,7 +313,7 @@ const WEBMANIFEST: &str = r##"{
 }
 "##;
 
-fn tool_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
+pub(crate) fn tool_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
     let font = FontId::new(14.0, FontFamily::Proportional);
     let w = ui.painter().layout_no_wrap(label.to_string(), font.clone(), FG).size().x + 28.0;
     let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
@@ -690,7 +692,7 @@ impl GenAiTool {
     }
 }
 
-fn pill_select(ui: &mut egui::Ui, values: &[&str], idx: &mut usize) {
+pub(crate) fn pill_select(ui: &mut egui::Ui, values: &[&str], idx: &mut usize) {
     ui.horizontal_wrapped(|ui| {
         for (i, v) in values.iter().enumerate() {
             let selected = *idx == i;

@@ -1,0 +1,183 @@
+//! Natural language -> structured intent.
+//!
+//! The model's only job is to turn a sentence into a symbol + amount. It never
+//! sees or emits an address, and it never computes anything: resolution and
+//! arithmetic happen here, in Rust, against the curated registry.
+
+use serde_json::Value;
+
+use super::market;
+use super::tokens::{self, Chain, Token};
+
+#[derive(Debug)]
+pub enum Intent {
+    Market {
+        sort: market::Sort,
+        limit: usize,
+    },
+    Price {
+        chain: &'static Chain,
+        token: &'static Token,
+    },
+    Quote {
+        chain: &'static Chain,
+        token_in: &'static Token,
+        token_out: &'static Token,
+        /// Base units. The human string is not carried along: the API echoes
+        /// the amount back, and that echo is what gets displayed.
+        amount_raw: u128,
+    },
+}
+
+pub fn system_prompt() -> String {
+    format!(
+        "You translate a user's crypto question into one JSON object. Reply with \
+the JSON only — no prose, no code fence.\n\n\
+Shapes:\n\
+  {{\"action\":\"market\",\"sort\":\"volume|market_cap|gainers|losers\",\"limit\":10}}\n\
+  {{\"action\":\"price\",\"chain\":\"<chain>\",\"token\":\"<symbol>\"}}\n\
+  {{\"action\":\"quote\",\"chain\":\"<chain>\",\"tokenIn\":\"<symbol>\",\
+\"tokenOut\":\"<symbol>\",\"amount\":\"<decimal>\"}}\n\
+  {{\"action\":\"unknown\",\"reason\":\"<short reason>\"}}\n\n\
+PREFER \"market\". It covers every question about the market at large — what is \
+moving, biggest volume, top coins, trending, best/worst performers, \"show me \
+the market\", or any vague request. It needs no coin and no chain. When the \
+question is even loosely about the market, answer with \"market\" rather than \
+refusing. Default to sort \"volume\" and limit 10 when unstated; map \
+\"biggest/top/most traded\" to volume, \"largest/biggest coins\" to market_cap, \
+\"pumping/up the most/best performers\" to gainers, \"dumping/down the most/worst\" \
+to losers. limit is at most 50.\n\n\
+Use \"price\" only for one specific token's value, and \"quote\" only to convert a \
+stated amount of one token into another. Both are restricted to these chains \
+and symbols:\n{}\n\
+Rules for price/quote:\n\
+- Never output a contract address. Only symbols from the list above.\n\
+- If the chain is not stated, use Ethereum.\n\
+- If the user names a token that is NOT in that list, do not refuse — answer \
+with \"market\" instead so they at least see live data.\n\
+- \"amount\" is a plain decimal string of the input token, e.g. \"0.5\". Never \
+convert it to base units, never do arithmetic.\n\n\
+Use \"unknown\" ONLY when the question has nothing to do with crypto, tokens, \
+prices or trading. Never use it merely because a coin or chain is missing.",
+        tokens::catalog()
+    )
+}
+
+/// Models sometimes wrap JSON in a fence despite being told not to.
+fn strip_fence(s: &str) -> &str {
+    let s = s.trim();
+    let Some(rest) = s.strip_prefix("```") else { return s };
+    let rest = rest.strip_prefix("json").unwrap_or(rest);
+    rest.trim_start_matches('\n').trim_end().trim_end_matches('`').trim()
+}
+
+fn chain_of(v: &Value) -> Result<&'static Chain, String> {
+    let name = v["chain"].as_str().unwrap_or("Ethereum");
+    tokens::chain_by_name(name).ok_or_else(|| format!("unsupported chain: {name}"))
+}
+
+fn token_of(chain: &'static Chain, v: &Value, key: &str) -> Result<&'static Token, String> {
+    let sym = v[key]
+        .as_str()
+        .ok_or_else(|| format!("missing `{key}` in the model's answer"))?;
+    chain.token(sym).ok_or_else(|| format!("{sym} is not whitelisted on {}", chain.name))
+}
+
+pub fn parse(raw: &str) -> Result<Intent, String> {
+    let cleaned = strip_fence(raw);
+    let v: Value = serde_json::from_str(cleaned)
+        .map_err(|_| format!("could not read the model's answer: {cleaned}"))?;
+
+    match v["action"].as_str().unwrap_or_default() {
+        "market" => {
+            let sort = v["sort"]
+                .as_str()
+                .and_then(market::Sort::parse)
+                .unwrap_or(market::Sort::Volume);
+            // Clamp here as well as in `fetch`: the model is not trusted to
+            // respect the stated maximum.
+            let limit = v["limit"].as_u64().unwrap_or(10).clamp(1, market::LIMIT_MAX as u64);
+            Ok(Intent::Market { sort, limit: limit as usize })
+        }
+        "price" => {
+            let chain = chain_of(&v)?;
+            let token = token_of(chain, &v, "token")?;
+            Ok(Intent::Price { chain, token })
+        }
+        "quote" => {
+            let chain = chain_of(&v)?;
+            let token_in = token_of(chain, &v, "tokenIn")?;
+            let token_out = token_of(chain, &v, "tokenOut")?;
+            if token_in.address.eq_ignore_ascii_case(token_out.address) {
+                return Err("input and output token are the same".into());
+            }
+            let amount_human = v["amount"]
+                .as_str()
+                .map(str::to_string)
+                // A model that ignores the "string" instruction still gives a
+                // usable number; don't fail the whole request over quoting.
+                .or_else(|| v["amount"].as_f64().map(|n| n.to_string()))
+                .ok_or("no amount in the model's answer")?;
+            let amount_raw = tokens::parse_units(&amount_human, token_in.decimals)?;
+            if amount_raw == 0 {
+                return Err("amount is zero".into());
+            }
+            Ok(Intent::Quote { chain, token_in, token_out, amount_raw })
+        }
+        "unknown" => {
+            Err(v["reason"].as_str().unwrap_or("could not understand the request").to_string())
+        }
+        other => Err(format!("unexpected action: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_quote() {
+        let i = parse(r#"{"action":"quote","chain":"Base","tokenIn":"ETH","tokenOut":"USDC","amount":"0.5"}"#)
+            .unwrap();
+        let Intent::Quote { chain, token_in, token_out, amount_raw, .. } = i else {
+            panic!("expected a quote");
+        };
+        assert_eq!(chain.id, 8453);
+        assert_eq!(token_in.symbol, "ETH");
+        assert_eq!(token_out.symbol, "USDC");
+        assert_eq!(amount_raw, 500_000_000_000_000_000);
+    }
+
+    #[test]
+    fn survives_a_code_fence() {
+        let raw = "```json\n{\"action\":\"price\",\"chain\":\"Ethereum\",\"token\":\"SUSHI\"}\n```";
+        assert!(matches!(parse(raw), Ok(Intent::Price { .. })));
+    }
+
+    #[test]
+    fn defaults_to_ethereum() {
+        let i = parse(r#"{"action":"price","token":"WBTC"}"#).unwrap();
+        let Intent::Price { chain, .. } = i else { panic!("expected a price") };
+        assert_eq!(chain.id, 1);
+    }
+
+    #[test]
+    fn refuses_tokens_outside_the_whitelist() {
+        let err = parse(r#"{"action":"quote","chain":"Ethereum","tokenIn":"ETH","tokenOut":"SCAMCOIN","amount":"1"}"#)
+            .unwrap_err();
+        assert!(err.contains("SCAMCOIN"), "{err}");
+    }
+
+    #[test]
+    fn refuses_an_address_smuggled_in_as_a_symbol() {
+        let err = parse(r#"{"action":"price","chain":"Ethereum","token":"0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}"#)
+            .unwrap_err();
+        assert!(err.contains("not whitelisted"), "{err}");
+    }
+
+    #[test]
+    fn reports_the_models_own_refusal() {
+        let err = parse(r#"{"action":"unknown","reason":"Solana is not supported"}"#).unwrap_err();
+        assert_eq!(err, "Solana is not supported");
+    }
+}

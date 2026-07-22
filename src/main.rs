@@ -18,6 +18,8 @@ use launcher::Command;
 mod tools;
 use tools::{Tool, ToolCtx};
 
+mod sushi;
+
 mod templates;
 
 mod doctor;
