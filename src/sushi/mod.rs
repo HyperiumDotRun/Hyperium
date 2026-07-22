@@ -32,6 +32,12 @@ const UP: Color32 = Color32::from_rgb(53, 192, 131);
 /// surface can be tuned without touching the shared design tokens.
 const ROW_HOVER: Color32 = Color32::from_rgb(34, 36, 41);
 
+/// One per intent the parser can produce — price, quote, market — so clicking
+/// through all three is a tour of everything the agent does. Written with bare
+/// tickers rather than company names: the model resolves against the whitelist,
+/// and a starter that misses would teach the wrong lesson about what it accepts.
+const EXAMPLES: &[&str] = &["price of SPCX", "2 WETH in NVDA", "top gainers"];
+
 const DEFAULT_SLIPPAGE: f64 = 0.005;
 const LOG_MAX: usize = 20;
 const MARKET_ROWS: usize = 10;
@@ -370,7 +376,16 @@ impl SushiTool {
                 self.refresh_equities(&ctx);
             }
         });
-        ui.add_space(6.0);
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(
+                "Shares in real companies, issued as tokens. SPCX is SpaceX and CBRS is Cerebras \
+                 — neither trades on a stock exchange.",
+            )
+            .color(DIM)
+            .small(),
+        );
+        ui.add_space(8.0);
 
         if let Some(e) = &self.equities_err {
             ui.label(RichText::new(format!("✗ {e}")).color(RED).small());
@@ -386,9 +401,14 @@ impl SushiTool {
                 equity_tile(ui, row);
             }
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         ui.label(
-            RichText::new("Pool-implied prices, not exchange quotes.").color(FAINT).small(),
+            RichText::new(
+                "Prices are what Sushi's pools will pay right now, not the exchange close. \
+                 A name with no pool simply doesn't appear.",
+            )
+            .color(FAINT)
+            .small(),
         );
     }
 
@@ -472,7 +492,15 @@ impl Tool for SushiTool {
             ui.ctx().request_repaint_after(Duration::from_secs(1));
         }
 
+        // The agent leads. Everything below it is the reference material you
+        // consult after asking, not before.
         egui::ScrollArea::vertical().show(ui, |ui| {
+            self.agent_section(ui, octx);
+
+            ui.add_space(18.0);
+            ui.separator();
+            ui.add_space(14.0);
+
             self.equities_section(ui);
 
             ui.add_space(18.0);
@@ -480,31 +508,21 @@ impl Tool for SushiTool {
             ui.add_space(14.0);
 
             self.market_section(ui);
-
-            ui.add_space(18.0);
-            ui.separator();
-            ui.add_space(14.0);
-
-            self.quote_section(ui, octx);
         });
     }
 }
 
 impl SushiTool {
-    fn quote_section(&mut self, ui: &mut egui::Ui, octx: &ToolCtx) {
+    fn agent_section(&mut self, ui: &mut egui::Ui, octx: &ToolCtx) {
         let busy = self.rx.is_some();
 
-        ui.label(RichText::new("QUOTE").color(ACCENT).small().strong());
-        ui.add_space(8.0);
-
-        let names: Vec<&str> = tokens::CHAINS.iter().map(|c| c.name).collect();
-        let before = self.chain_idx;
-        pill_select(ui, &names, &mut self.chain_idx);
-        if self.chain_idx != before {
-            let n = self.chain().tokens.len();
-            self.in_idx = self.in_idx.min(n - 1);
-            self.out_idx = self.out_idx.min(n - 1);
-        }
+        ui.label(RichText::new("AGENT").color(ACCENT).small().strong());
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("Ask in plain English. It reads prices; it cannot spend anything.")
+                .color(DIM)
+                .small(),
+        );
         ui.add_space(10.0);
 
         let has_ai = !self.ai_key.trim().is_empty();
@@ -512,7 +530,7 @@ impl SushiTool {
             let field = ui.add_enabled(
                 has_ai && !busy,
                 egui::TextEdit::singleline(&mut self.ask)
-                    .hint_text("how much is 0.5 ETH in USDC?")
+                    .hint_text("how much is 1 WETH in NVDA?")
                     // Capped: the panel can be 1900px wide, and a text field
                     // stretched that far pushes Ask off to the far edge.
                     .desired_width((ui.available_width() - 90.0).min(420.0)),
@@ -525,6 +543,33 @@ impl SushiTool {
         });
         if !has_ai {
             self.ai_key_setup(ui, octx);
+        }
+
+        // Starters, because the hardest part of a blank box is the first
+        // question. Clicking one asks it outright rather than only filling
+        // the field — a starter you still have to submit is just placeholder text.
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("try").color(FAINT).small());
+            for q in EXAMPLES {
+                if tool_button(ui, q, has_ai && !busy) && has_ai && !busy {
+                    self.ask = (*q).to_string();
+                    let ctx = ui.ctx().clone();
+                    self.ask_model(&ctx);
+                }
+            }
+        });
+        ui.add_space(14.0);
+
+        ui.label(RichText::new("or pick the pair yourself").color(FAINT).small());
+        ui.add_space(6.0);
+        let names: Vec<&str> = tokens::CHAINS.iter().map(|c| c.name).collect();
+        let before = self.chain_idx;
+        pill_select(ui, &names, &mut self.chain_idx);
+        if self.chain_idx != before {
+            let n = self.chain().tokens.len();
+            self.in_idx = self.in_idx.min(n - 1);
+            self.out_idx = self.out_idx.min(n - 1);
         }
         ui.add_space(10.0);
 
