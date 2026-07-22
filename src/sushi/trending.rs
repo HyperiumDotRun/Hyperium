@@ -27,6 +27,15 @@ const CHAIN: &str = "robinhood";
 /// The same chain as `CHAIN`, spelled the way `tokens::CHAINS` spells it.
 pub const CHAIN_NAME: &str = "Robinhood";
 
+/// Sushi's own swap UI, pre-filled with a token bought against the chain's
+/// native ETH. Verified live in a browser: the chain comes from this path
+/// segment, not from a `chainId` query parameter — that parameter exists but
+/// silently falls back to Ethereum instead of erroring, which would have
+/// shipped a link that quietly swapped on the wrong chain.
+pub fn sushi_swap_url(token_out_address: &str) -> String {
+    format!("https://www.sushi.com/{CHAIN}/swap?token0=NATIVE&token1={token_out_address}")
+}
+
 /// Pairs are enumerated through their quote side. WETH and USDG cover most of
 /// the board; VIRTUAL is what a Virtuals bonding-curve launch pairs against,
 /// so a token's own first pool is often against this one, not the other two —

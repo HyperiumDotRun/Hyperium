@@ -37,7 +37,7 @@ const ROW_HOVER: Color32 = Color32::from_rgb(34, 36, 41);
 /// through all three is a tour of everything the agent does. Written with bare
 /// tickers because the model resolves against the whitelist, and a starter that
 /// missed would teach the wrong lesson about what the agent accepts.
-const EXAMPLES: &[&str] = &["price of WETH", "1 WETH in USDG", "top gainers"];
+const EXAMPLES: &[&str] = &["price of WETH", "1 WETH in USDG", "what's pumping"];
 
 /// Phrases cycled while a request is in flight. They name the step actually
 /// under way, so the wait reads as work rather than as a hang.
@@ -50,21 +50,26 @@ const TRENDING_ROWS: usize = 14;
 
 /// The brief for the chart read.
 ///
-/// Deliberately barred from advising. This panel shows a live market inside a
-/// tool the author also holds a token on, and a model that says "buy" there is
-/// a liability dressed up as a feature. Describing what the numbers do is
-/// genuinely useful and carries none of that.
+/// Voice is degen on purpose — this is a shitcoin board, and a stiff analyst
+/// tone reads false on it. What's still barred, deliberately: recommending a
+/// token. This panel shows a live market inside a tool the author also holds
+/// a token on, and a model that tells someone to buy is a liability dressed
+/// up as a feature — that line doesn't move for tone.
 const TAKE_SYSTEM: &str = "\
-You are reading one token's live trading data from a DEX indexer on Robinhood Chain.
+You are reading one token's live trading data from a DEX indexer on Robinhood Chain. \
+This is a degen shitcoin board, not a research desk — talk like it. Blunt, funny, a \
+little unhinged, crypto-twitter vernacular is fine. You are not a financial analyst \
+and should not sound like one.
 
-Reply with two or three short sentences on what the numbers show: how the move looks \
-across the 5m/1h/6h/24h windows, whether volume and the buy/sell split back it up, how \
-thin liquidity is next to that volume, and how young the pool is.
+Reply with two or three short sentences reacting to what the numbers show: how the move \
+looks across the 5m/1h/6h/24h windows, whether volume and the buy/sell split back it up, \
+how thin liquidity is next to that volume, and how young the pool is. Have an opinion on \
+whether the chart looks unhinged, exhausted, suspicious, or boring — that's the fun part.
 
-Cite the actual figures you are reading. Be plain and concrete.
+Cite the actual figures you are reading. Personality doesn't excuse making numbers up.
 
-Describe only. Never advise, never predict, never state what someone should do. Do not \
-use the words buy, sell, should, will, pump, moon, or safe.";
+Never tell anyone to buy or sell this or any other token, never say a price will go up \
+or down, never call anything safe. You can roast a chart; you cannot recommend one.";
 
 const DEFAULT_SLIPPAGE: f64 = 0.005;
 const LOG_MAX: usize = 20;
@@ -857,9 +862,9 @@ impl SushiTool {
             ui.add_space(3.0);
             ui.label(
                 RichText::new(
-                    "Ask it anything about the chain, or drop a ticker and it reads the chart. \
-                     It can also swap through Sushi — every transaction is confirmed in your \
-                     own Frame wallet, never signed here.",
+                    "Ask it anything, or drop a ticker and let it roast the chart. It can also \
+                     swap through Sushi — you confirm every send yourself in Frame, this thing \
+                     never touches your keys.",
                 )
                 .color(DIM)
                 .small(),
@@ -876,7 +881,7 @@ impl SushiTool {
                 let field = ui.add_enabled(
                     !busy,
                     egui::TextEdit::singleline(&mut self.ticker)
-                        .hint_text("ticker — try PONS, SWOGE, r0b")
+                        .hint_text("ticker — PONS, SWOGE, r0b, whatever you're aping into")
                         .font(FontId::monospace(14.0))
                         .desired_width(200.0),
                 );
@@ -1460,13 +1465,13 @@ fn token_card(
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("◆").color(ACCENT).small());
-            ui.label(RichText::new("THE AGENT READS IT").color(ACCENT).small().strong());
+            ui.label(RichText::new("THE AGENT'S HOT TAKE").color(ACCENT).small().strong());
         });
         ui.add_space(6.0);
         ui.label(RichText::new(take).color(FG));
         ui.add_space(6.0);
         ui.label(
-            RichText::new("A description of the numbers above. Not advice.")
+            RichText::new("Reacting to the numbers above, not a signal — it will never tell you to buy or sell.")
                 .color(FAINT)
                 .small(),
         );
@@ -1486,6 +1491,14 @@ fn token_card(
                 &info.url,
             );
         }
+        // The zero-setup path: opens Sushi's own swap UI with this token
+        // pre-filled. Verified live — the chain comes from the URL's path
+        // segment, not a query parameter, which is not the obvious way to
+        // read it. No wallet code of ours is involved past this link.
+        ui.hyperlink_to(
+            RichText::new("swap on sushi.com ↗").color(ACCENT).small(),
+            trending::sushi_swap_url(&info.address),
+        );
     });
 
     // The swap block. Absent entirely without a connected wallet, rather than
