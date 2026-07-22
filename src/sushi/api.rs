@@ -65,14 +65,6 @@ fn get(url: &str, params: &[(&str, String)], api_key: &str) -> Result<Value, Str
     }
 }
 
-/// Every priced token on a chain, keyed by lowercase address.
-///
-/// Returned raw: the caller knows which addresses it cares about, and the map
-/// runs to a couple of thousand entries on a busy chain.
-pub fn prices(chain_id: u64, api_key: &str) -> Result<Value, String> {
-    get(&format!("{BASE}/price/v1/{chain_id}"), &[], api_key)
-}
-
 /// USD price of a single token.
 pub fn price(chain_id: u64, address: &str, api_key: &str) -> Result<f64, String> {
     let url = format!("{BASE}/price/v1/{chain_id}/{address}");
