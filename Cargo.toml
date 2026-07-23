@@ -1,0 +1,50 @@
+[package]
+name = "hyperium"
+version = "0.62.1"
+edition = "2024"
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+eframe = "0.34.3"
+egui = "0.34.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif"] }
+portable-pty = "0.9.0"
+rfd = "0.17.2"
+rodio = "0.22.2"
+sysinfo = "0.39.3"
+tauri-winrt-notification = "0.7.2"
+tray-icon = "0.24.0"
+windows = { version = "0.62.2", features = [
+    "Win32_UI_Shell",
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust", # WinVerifyTrust - Authenticode check on self-update exe
+    "Win32_System_Console",    # AttachConsole - headless gen-image CLI stdout in release
+    "Win32_Storage_FileSystem", # CreateFileW(CONOUT$/CONIN$) to repoint std handles
+] }
+arboard = "3" # cross-platform clipboard read (Win/mac/Linux) for right-click paste
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+cpal = "0.17"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# End-to-end encryption of synced notes (pure-Rust RustCrypto, no C):
+chacha20poly1305 = "0.10" # XChaCha20-Poly1305 AEAD
+argon2 = "0.5"            # Argon2id passphrase KDF
+getrandom = "0.2"         # OS CSPRNG for salt + nonce
+suppaftp = { version = "6", features = ["rustls"] } # FTP/FTPS notes sync (pure-Rust TLS)
+webpki-roots = "0.26" # TLS trust anchors for FTPS
+sha2 = "0.10" # SHA-256 integrity check of downloaded update / whisper assets
+# Local wallet signer (src/sushi/signer.rs): no third-party signer, the key
+# never leaves this machine, and only the short-lived --sign-worker child
+# process ever decrypts it:
+k256 = { version = "0.13", features = ["ecdsa"] } # secp256k1 sign + address derivation, pure Rust
+sha3 = "0.10"  # Keccak256, for tx hashing and address derivation
+rlp = "0.5"    # RLP list/string framing for the signed transaction
+hex = "0.4"    # hex codec for addresses, calldata, raw signed tx bytes
+zeroize = "1"  # deterministic wipe of decrypted key material
+
+[build-dependencies]
+winresource = "0.1"
