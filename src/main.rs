@@ -5513,6 +5513,13 @@ fn main() -> eframe::Result<()> {
         let args: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(genai::cli_main(&config_dir(), &args));
     }
+    // Signs exactly one transaction (read as JSON from stdin) against the
+    // locally-held wallet key, then exits — see `sushi/signer.rs`. Spawned
+    // by the running app itself, never meant to be typed by a user, so no
+    // console is attached and nothing but the signed hex touches stdout.
+    if std::env::args().nth(1).as_deref() == Some("--sign-worker") {
+        std::process::exit(sushi::sign_worker_main(&config_dir()));
+    }
 
     notify::set_process_aumid();
 

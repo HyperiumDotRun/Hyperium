@@ -145,6 +145,36 @@ pub fn money_compact(v: f64) -> String {
     }
 }
 
+/// A raw base-unit decimal string (e.g. `format_units`'s output) rendered at
+/// human scale: thousands separators on the integer part, and a decimal
+/// precision chosen from magnitude — a swap preview showing all 18
+/// fractional digits of an 18-decimal token is unreadable, not precise.
+pub fn token_amount(raw: &str) -> String {
+    let v: f64 = raw.parse().unwrap_or(0.0);
+    let decimals = if v.abs() >= 1000.0 {
+        2
+    } else if v.abs() >= 1.0 {
+        4
+    } else {
+        6
+    };
+    let whole = format!("{v:.decimals$}");
+    let (int_part, frac_part) = whole.split_once('.').unwrap_or((whole.as_str(), ""));
+    let (sign, digits) = int_part.strip_prefix('-').map_or(("", int_part), |d| ("-", d));
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    if frac_part.is_empty() {
+        format!("{sign}{grouped}")
+    } else {
+        format!("{sign}{grouped}.{frac_part}")
+    }
+}
+
 /// Price with precision chosen from magnitude: a stablecoin needs four
 /// decimals to show it is off peg, BTC needs none.
 pub fn money_price(v: f64) -> String {

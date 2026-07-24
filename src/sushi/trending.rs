@@ -54,18 +54,33 @@ pub struct Row {
     pub address: String,
     pub price_usd: f64,
     /// Percent, already signed. Absent when the pair is too young to have one.
-    pub change_h24: Option<f64>,
+    pub change_m5: Option<f64>,
     pub change_h1: Option<f64>,
-    pub volume_h24: f64,
+    pub change_h6: Option<f64>,
+    pub change_h24: Option<f64>,
     /// The window that actually says whether this is heating up right now —
     /// 24h volume alone can't tell a token that traded hard six hours ago and
     /// has gone quiet since from one that's moving this minute.
+    pub volume_m5: f64,
     pub volume_h1: f64,
     pub volume_h6: f64,
+    pub volume_h24: f64,
     pub liquidity_usd: f64,
     pub market_cap: Option<f64>,
-    /// Buy/sell pressure over 24h — volume says how much moved, this says
-    /// which direction the crowd leaned while it did.
+    /// Fully diluted valuation — distinct from `market_cap` whenever a chunk
+    /// of supply isn't circulating yet, which on a permissionless chain full
+    /// of days-old launches is closer to the rule than the exception.
+    pub fdv: Option<f64>,
+    /// Buy/sell pressure at every window Dexscreener tracks — volume says how
+    /// much moved, this says which direction the crowd leaned while it did,
+    /// and having all four windows is what lets "pressure just flipped"
+    /// actually be answerable instead of only "pressure over the whole day".
+    pub buys_m5: u64,
+    pub sells_m5: u64,
+    pub buys_h1: u64,
+    pub sells_h1: u64,
+    pub buys_h6: u64,
+    pub sells_h6: u64,
     pub buys_h24: u64,
     pub sells_h24: u64,
     /// Pool creation, epoch ms. Age is what tells a fresh launch from a
@@ -75,6 +90,53 @@ pub struct Row {
     /// "sushiswap", "pancakeswap"... Carried through so the board can label a
     /// row honestly instead of trading under a brand it did not earn.
     pub dex_id: String,
+    /// Pair labels Dexscreener attaches itself — e.g. `["v3"]`. Empty, not
+    /// absent, when there are none: nothing here is optional-shaped, it's
+    /// just a list that's sometimes zero-length.
+    pub labels: Vec<String>,
+}
+
+/// Which of Dexscreener's four windows to rank and read a token's activity
+/// by. Distinct from a `Row`'s own fields (which carry every window
+/// regardless) — this only decides which one `rank` sorts on and which one
+/// `chat_reply`/the model's take calls "the" volume for this turn.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Window {
+    M5,
+    H1,
+    H6,
+    H24,
+}
+
+impl Window {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "m5" => Some(Self::M5),
+            "h1" => Some(Self::H1),
+            "h6" => Some(Self::H6),
+            "h24" => Some(Self::H24),
+            _ => None,
+        }
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::M5 => "5 minutes",
+            Self::H1 => "1 hour",
+            Self::H6 => "6 hours",
+            Self::H24 => "24 hours",
+        }
+    }
+}
+
+impl Row {
+    pub fn volume(&self, w: Window) -> f64 {
+        match w {
+            Window::M5 => self.volume_m5,
+            Window::H1 => self.volume_h1,
+            Window::H6 => self.volume_h6,
+            Window::H24 => self.volume_h24,
+        }
+    }
 }
 
 /// True for Dexscreener's own spelling of Sushi's pools. Exact match, not a
@@ -97,15 +159,29 @@ pub struct Info {
     pub change_h1: Option<f64>,
     pub change_h6: Option<f64>,
     pub change_h24: Option<f64>,
-    pub volume_h24: f64,
+    pub volume_m5: f64,
     pub volume_h1: f64,
+    pub volume_h6: f64,
+    pub volume_h24: f64,
     pub liquidity_usd: f64,
     pub market_cap: Option<f64>,
+    pub fdv: Option<f64>,
+    pub buys_m5: u64,
+    pub sells_m5: u64,
+    pub buys_h1: u64,
+    pub sells_h1: u64,
     pub buys_h24: u64,
     pub sells_h24: u64,
     pub created_at_ms: Option<u64>,
     pub url: String,
     pub dex_id: String,
+    pub labels: Vec<String>,
+    /// From Dexscreener's own token profile, when the project has submitted
+    /// one — `None` is the common case for anything just launched, not a
+    /// fetch failure.
+    pub image_url: Option<String>,
+    pub website: Option<String>,
+    pub twitter: Option<String>,
 }
 
 impl Info {
@@ -128,11 +204,14 @@ impl Info {
             Some(h) => format!("{:.0} days", h / 24.0),
             None => "unknown".into(),
         };
+        let money = |v: Option<f64>| v.map(|m| format!("${m:.0}")).unwrap_or_else(|| "n/a".into());
         format!(
             "token: {} ({})\ntraded on: {} (Robinhood Chain)\nprice: ${}\n\
              change 5m/1h/6h/24h: {} / {} / {} / {}\n\
-             volume 1h: ${:.0}\nvolume 24h: ${:.0}\nliquidity: ${:.0}\nmarket cap: {}\n\
-             buys/sells 24h: {} / {}\npool age: {}",
+             volume 5m/1h/24h: ${:.0} / ${:.0} / ${:.0}\n\
+             liquidity: ${:.0}\nmarket cap: {}\nfully diluted valuation: {}\n\
+             buys/sells 5m: {} / {}\nbuys/sells 1h: {} / {}\nbuys/sells 24h: {} / {}\n\
+             pool age: {}\npool type: {}{}{}{}",
             self.symbol,
             self.name,
             self.dex_id,
@@ -141,13 +220,23 @@ impl Info {
             pct(self.change_h1),
             pct(self.change_h6),
             pct(self.change_h24),
+            self.volume_m5,
             self.volume_h1,
             self.volume_h24,
             self.liquidity_usd,
-            self.market_cap.map(|m| format!("${m:.0}")).unwrap_or_else(|| "n/a".into()),
+            money(self.market_cap),
+            money(self.fdv),
+            self.buys_m5,
+            self.sells_m5,
+            self.buys_h1,
+            self.sells_h1,
             self.buys_h24,
             self.sells_h24,
             age,
+            if self.labels.is_empty() { "standard".to_string() } else { self.labels.join(", ") },
+            self.website.as_ref().map(|w| format!("\nwebsite: {w}")).unwrap_or_default(),
+            self.twitter.as_ref().map(|t| format!("\ntwitter: {t}")).unwrap_or_default(),
+            if self.image_url.is_some() { "\nhas a submitted logo/profile" } else { "" },
         )
     }
 }
@@ -191,7 +280,7 @@ fn pairs_for(address: &str) -> Result<Vec<Value>, String> {
     }
 }
 
-pub fn fetch(limit: usize) -> Result<Vec<Row>, String> {
+pub fn fetch(limit: usize, window: Window) -> Result<Vec<Row>, String> {
     let chain = super::tokens::chain_by_name(CHAIN_NAME)
         .ok_or("no Robinhood chain in the registry")?;
 
@@ -209,7 +298,7 @@ pub fn fetch(limit: usize) -> Result<Vec<Row>, String> {
         return Err(last_err.unwrap_or_else(|| "no pairs returned".into()));
     }
 
-    let rows = rank(&raw, limit);
+    let rows = rank(&raw, limit, window);
     if rows.is_empty() {
         return Err("no tradable pairs on this chain right now".into());
     }
@@ -266,7 +355,25 @@ pub fn lookup(query: &str) -> Result<Info, String> {
         })
         .ok_or_else(|| format!("no {query} pool on Robinhood Chain"))?;
 
-    let txns = &best["txns"]["h24"];
+    let txns_m5 = &best["txns"]["m5"];
+    let txns_h1 = &best["txns"]["h1"];
+    let txns_h24 = &best["txns"]["h24"];
+    let info = &best["info"];
+    let website = info["websites"]
+        .as_array()
+        .and_then(|w| w.first())
+        .and_then(|w| w["url"].as_str())
+        .map(str::to_string);
+    let twitter = info["socials"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["type"].as_str() == Some("twitter")))
+        .and_then(|s| s["url"].as_str())
+        .map(str::to_string);
+    let labels = best["labels"]
+        .as_array()
+        .map(|l| l.iter().filter_map(|s| s.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+
     Ok(Info {
         symbol: best["baseToken"]["symbol"].as_str().unwrap_or(query).to_string(),
         name: best["baseToken"]["name"].as_str().unwrap_or_default().to_string(),
@@ -276,15 +383,26 @@ pub fn lookup(query: &str) -> Result<Info, String> {
         change_h1: num(&best["priceChange"]["h1"]),
         change_h6: num(&best["priceChange"]["h6"]),
         change_h24: num(&best["priceChange"]["h24"]),
-        volume_h24: num(&best["volume"]["h24"]).unwrap_or(0.0),
+        volume_m5: num(&best["volume"]["m5"]).unwrap_or(0.0),
         volume_h1: num(&best["volume"]["h1"]).unwrap_or(0.0),
+        volume_h6: num(&best["volume"]["h6"]).unwrap_or(0.0),
+        volume_h24: num(&best["volume"]["h24"]).unwrap_or(0.0),
         liquidity_usd: num(&best["liquidity"]["usd"]).unwrap_or(0.0),
         market_cap: num(&best["marketCap"]),
-        buys_h24: txns["buys"].as_u64().unwrap_or(0),
-        sells_h24: txns["sells"].as_u64().unwrap_or(0),
+        fdv: num(&best["fdv"]),
+        buys_m5: txns_m5["buys"].as_u64().unwrap_or(0),
+        sells_m5: txns_m5["sells"].as_u64().unwrap_or(0),
+        buys_h1: txns_h1["buys"].as_u64().unwrap_or(0),
+        sells_h1: txns_h1["sells"].as_u64().unwrap_or(0),
+        buys_h24: txns_h24["buys"].as_u64().unwrap_or(0),
+        sells_h24: txns_h24["sells"].as_u64().unwrap_or(0),
         created_at_ms: best["pairCreatedAt"].as_u64(),
         url: best["url"].as_str().unwrap_or_default().to_string(),
         dex_id: best["dexId"].as_str().unwrap_or("unknown").to_string(),
+        labels,
+        image_url: info["imageUrl"].as_str().map(str::to_string),
+        website,
+        twitter,
     })
 }
 
@@ -308,7 +426,7 @@ fn urlencode(s: &str) -> String {
 /// A token usually has several pools — one against WETH, one against USDG,
 /// sometimes several fee tiers. Showing each would fill the board with
 /// duplicates, so the pair doing the most volume wins and stands for the token.
-fn rank(raw: &[Value], limit: usize) -> Vec<Row> {
+fn rank(raw: &[Value], limit: usize, window: Window) -> Vec<Row> {
     let mut best: Vec<Row> = Vec::new();
 
     for p in raw {
@@ -322,25 +440,45 @@ fn rank(raw: &[Value], limit: usize) -> Vec<Row> {
         if QUOTES.contains(&symbol) {
             continue;
         }
-        let volume_h24 = num(&p["volume"]["h24"]).unwrap_or(0.0);
-        let txns24 = &p["txns"]["h24"];
+        let txns_m5 = &p["txns"]["m5"];
+        let txns_h1 = &p["txns"]["h1"];
+        let txns_h6 = &p["txns"]["h6"];
+        let txns_h24 = &p["txns"]["h24"];
         let row = Row {
             symbol: symbol.to_string(),
             address: address.to_string(),
             price_usd: num(&p["priceUsd"]).unwrap_or(0.0),
-            change_h24: num(&p["priceChange"]["h24"]),
+            change_m5: num(&p["priceChange"]["m5"]),
             change_h1: num(&p["priceChange"]["h1"]),
-            volume_h24,
+            change_h6: num(&p["priceChange"]["h6"]),
+            change_h24: num(&p["priceChange"]["h24"]),
+            volume_m5: num(&p["volume"]["m5"]).unwrap_or(0.0),
             volume_h1: num(&p["volume"]["h1"]).unwrap_or(0.0),
             volume_h6: num(&p["volume"]["h6"]).unwrap_or(0.0),
+            volume_h24: num(&p["volume"]["h24"]).unwrap_or(0.0),
             liquidity_usd: num(&p["liquidity"]["usd"]).unwrap_or(0.0),
             market_cap: num(&p["marketCap"]),
-            buys_h24: txns24["buys"].as_u64().unwrap_or(0),
-            sells_h24: txns24["sells"].as_u64().unwrap_or(0),
+            fdv: num(&p["fdv"]),
+            buys_m5: txns_m5["buys"].as_u64().unwrap_or(0),
+            sells_m5: txns_m5["sells"].as_u64().unwrap_or(0),
+            buys_h1: txns_h1["buys"].as_u64().unwrap_or(0),
+            sells_h1: txns_h1["sells"].as_u64().unwrap_or(0),
+            buys_h6: txns_h6["buys"].as_u64().unwrap_or(0),
+            sells_h6: txns_h6["sells"].as_u64().unwrap_or(0),
+            buys_h24: txns_h24["buys"].as_u64().unwrap_or(0),
+            sells_h24: txns_h24["sells"].as_u64().unwrap_or(0),
             created_at_ms: p["pairCreatedAt"].as_u64(),
             dex_id: p["dexId"].as_str().unwrap_or("unknown").to_string(),
+            labels: p["labels"]
+                .as_array()
+                .map(|l| l.iter().filter_map(|s| s.as_str()).map(str::to_string).collect())
+                .unwrap_or_default(),
         };
 
+        // The 24h-busiest pool still wins the "which pool represents this
+        // token" tie-break regardless of the requested window — the window
+        // only decides sort order among tokens, not which of a token's own
+        // pools is the real one.
         match best.iter_mut().find(|r| r.address.eq_ignore_ascii_case(&row.address)) {
             Some(existing) if existing.volume_h24 < row.volume_h24 => *existing = row,
             Some(_) => {}
@@ -349,7 +487,7 @@ fn rank(raw: &[Value], limit: usize) -> Vec<Row> {
     }
 
     best.sort_by(|a, b| {
-        b.volume_h24.partial_cmp(&a.volume_h24).unwrap_or(std::cmp::Ordering::Equal)
+        b.volume(window).partial_cmp(&a.volume(window)).unwrap_or(std::cmp::Ordering::Equal)
     });
     best.truncate(limit);
     best
@@ -364,27 +502,55 @@ mod tests {
         json!({
             "baseToken": { "symbol": sym, "address": addr },
             "priceUsd": "0.0001",
-            "priceChange": { "h24": 12.5, "h1": 3.1 },
-            "volume": { "h24": vol, "h1": vol / 10.0, "h6": vol / 2.0 },
+            "priceChange": { "h24": 12.5, "h1": 3.1, "m5": 0.4 },
+            "volume": { "h24": vol, "h1": vol / 10.0, "h6": vol / 2.0, "m5": vol / 100.0 },
             "liquidity": { "usd": 1000.0 },
             "marketCap": 50_000.0,
-            "txns": { "h24": { "buys": 40, "sells": 25 } },
+            "fdv": 75_000.0,
+            "txns": {
+                "m5": { "buys": 2, "sells": 1 },
+                "h1": { "buys": 8, "sells": 5 },
+                "h6": { "buys": 20, "sells": 15 },
+                "h24": { "buys": 40, "sells": 25 }
+            },
             "pairCreatedAt": 1_700_000_000_000u64,
             "url": "https://dexscreener.com/robinhood/x",
-            "dexId": "uniswap"
+            "dexId": "uniswap",
+            "labels": ["v3"]
         })
     }
 
     #[test]
     fn reads_the_full_set_of_windows_and_pressure() {
         let raw = vec![pair("X", "0xx", 1000.0)];
-        let row = &rank(&raw, 10)[0];
+        let row = &rank(&raw, 10, Window::H24)[0];
+        assert_eq!(row.volume_m5, 10.0);
         assert_eq!(row.volume_h1, 100.0);
         assert_eq!(row.volume_h6, 500.0);
         assert_eq!(row.change_h1, Some(3.1));
         assert_eq!(row.market_cap, Some(50_000.0));
+        assert_eq!(row.fdv, Some(75_000.0));
+        assert_eq!(row.buys_m5, 2);
+        assert_eq!(row.sells_m5, 1);
         assert_eq!(row.buys_h24, 40);
         assert_eq!(row.sells_h24, 25);
+        assert_eq!(row.labels, vec!["v3".to_string()]);
+    }
+
+    #[test]
+    fn ranks_by_the_requested_window_not_always_h24() {
+        // B has the bigger 24h number, but A is the one actually moving in
+        // the last 5 minutes — asking for m5 should surface A first.
+        let mut a = pair("A", "0xa", 100.0);
+        a["volume"]["m5"] = json!(500.0);
+        let b = pair("B", "0xb", 900.0);
+        let raw = vec![a, b];
+
+        let by_h24 = rank(&raw, 10, Window::H24);
+        assert_eq!(by_h24[0].symbol, "B");
+
+        let by_m5 = rank(&raw, 10, Window::M5);
+        assert_eq!(by_m5[0].symbol, "A");
     }
 
     #[test]
@@ -398,13 +564,13 @@ mod tests {
     #[test]
     fn carries_the_dex_id_through() {
         let raw = vec![pair("X", "0xx", 1.0)];
-        assert_eq!(rank(&raw, 10)[0].dex_id, "uniswap");
+        assert_eq!(rank(&raw, 10, Window::H24)[0].dex_id, "uniswap");
     }
 
     #[test]
     fn ranks_by_volume() {
         let raw = vec![pair("A", "0xa", 10.0), pair("B", "0xb", 900.0), pair("C", "0xc", 50.0)];
-        let ranked = rank(&raw, 10);
+        let ranked = rank(&raw, 10, Window::H24);
         let got: Vec<&str> = ranked.iter().map(|r| r.symbol.as_str()).collect();
         assert_eq!(got, ["B", "C", "A"]);
     }
@@ -413,7 +579,7 @@ mod tests {
     fn one_row_per_token_keeping_the_busiest_pool() {
         // Same token, two pools; the quieter one must not appear at all.
         let raw = vec![pair("DUP", "0xdup", 5.0), pair("DUP", "0xDUP", 700.0)];
-        let rows = rank(&raw, 10);
+        let rows = rank(&raw, 10, Window::H24);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].volume_h24, 700.0);
     }
@@ -421,7 +587,7 @@ mod tests {
     #[test]
     fn drops_quote_tokens_appearing_as_a_base() {
         let raw = vec![pair("WETH", "0xw", 999.0), pair("REAL", "0xr", 1.0)];
-        let rows = rank(&raw, 10);
+        let rows = rank(&raw, 10, Window::H24);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].symbol, "REAL");
     }
@@ -430,7 +596,7 @@ mod tests {
     fn honours_the_limit() {
         let raw: Vec<Value> =
             (0..20).map(|i| pair(&format!("T{i}"), &format!("0x{i}"), i as f64)).collect();
-        assert_eq!(rank(&raw, 5).len(), 5);
+        assert_eq!(rank(&raw, 5, Window::H24).len(), 5);
     }
 
     #[test]
@@ -444,7 +610,7 @@ mod tests {
     #[test]
     fn survives_a_pair_with_fields_missing() {
         let raw = vec![json!({ "baseToken": { "symbol": "X", "address": "0xx" } })];
-        let rows = rank(&raw, 10);
+        let rows = rank(&raw, 10, Window::H24);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].volume_h24, 0.0);
         assert_eq!(rows[0].change_h24, None);

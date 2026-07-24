@@ -27,6 +27,7 @@ windows = { version = "0.62.2", features = [
 ] }
 arboard = "3" # cross-platform clipboard read (Win/mac/Linux) for right-click paste
 ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 cpal = "0.17"
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -37,6 +38,14 @@ getrandom = "0.2"         # OS CSPRNG for salt + nonce
 suppaftp = { version = "6", features = ["rustls"] } # FTP/FTPS notes sync (pure-Rust TLS)
 webpki-roots = "0.26" # TLS trust anchors for FTPS
 sha2 = "0.10" # SHA-256 integrity check of downloaded update / whisper assets
+# Local wallet signer (src/sushi/signer.rs): no third-party signer, the key
+# never leaves this machine, and only the short-lived --sign-worker child
+# process ever decrypts it:
+k256 = { version = "0.13", features = ["ecdsa"] } # secp256k1 sign + address derivation, pure Rust
+sha3 = "0.10"  # Keccak256, for tx hashing and address derivation
+rlp = "0.5"    # RLP list/string framing for the signed transaction
+hex = "0.4"    # hex codec for addresses, calldata, raw signed tx bytes
+zeroize = "1"  # deterministic wipe of decrypted key material
 
 [build-dependencies]
 winresource = "0.1"

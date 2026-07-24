@@ -28,6 +28,14 @@ pub fn encode_approve(spender: &str, amount: u128) -> Result<String, String> {
     Ok(format!("0x095ea7b3{}{}", pad_address(spender)?, pad_u128(amount)))
 }
 
+/// Calldata for `balanceOf(owner)` — selector `0x70a08231`.
+pub fn encode_balance_of(owner: &str) -> Result<String, String> {
+    Ok(format!("0x70a08231{}", pad_address(owner)?))
+}
+
+/// Calldata for `decimals()` — no arguments, just the selector.
+pub const DECIMALS_CALL: &str = "0x313ce567";
+
 /// An `eth_call` return value is a 32-byte word, possibly with a `0x` prefix
 /// and possibly short (some nodes trim leading zeros). Saturating rather than
 /// erroring on overflow: an allowance bigger than `u128::MAX` still just
@@ -71,6 +79,14 @@ mod tests {
         let c = encode_approve(SPENDER, 1).unwrap();
         assert!(c.starts_with("0x095ea7b3"));
         assert!(c.ends_with(&format!("{}1", "0".repeat(63))));
+    }
+
+    #[test]
+    fn balance_of_selector_and_padding() {
+        let c = encode_balance_of(OWNER).unwrap();
+        assert!(c.starts_with("0x70a08231"));
+        assert_eq!(c.len(), 2 + 8 + 64);
+        assert!(c.ends_with("0bd7d308f8e1639fab988df18a8011f41eacad73"));
     }
 
     #[test]

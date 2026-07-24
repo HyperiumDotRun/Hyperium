@@ -1,18 +1,30 @@
-//! Sushi agent — read-only.
+//! Sushi agent.
 //!
 //! The agent leads: you ask in plain English and it answers. Below it sit the
 //! two boards it draws on — what is launching on Robinhood Chain right now, and
 //! what is moving across the wider market. The model only ever parses intent;
-//! resolution, arithmetic and API calls happen in Rust. Nothing here can sign
-//! or broadcast a transaction.
+//! resolution, arithmetic and API calls happen in Rust. The model itself never
+//! signs or broadcasts anything — a swap only ever moves once a human has
+//! confirmed the exact amount, recipient and gas shown in this app's own
+//! confirmation panel, backed by a locally-held key (`signer.rs`) that never
+//! leaves this machine.
 
 mod api;
+mod chain_rpc;
 mod erc20;
 mod trending;
 mod intent;
 mod market;
+mod signer;
 mod tokens;
-mod wallet;
+
+/// Entry point for `hyperium --sign-worker <config-dir>`: reads one
+/// transaction as JSON from stdin, signs it against the key stored in that
+/// config dir, and writes the signed raw tx to stdout. See `signer.rs` for
+/// why this runs as its own short-lived process rather than inline.
+pub fn sign_worker_main(cfg: &std::path::Path) -> i32 {
+    signer::run_worker(cfg)
+}
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -93,7 +105,77 @@ much of this is Uniswap vs Sushi. Cite real figures from the list.
 Never say which one to buy, never rank them by which is the better trade, never call \
 anything safe. Describe the board. Do not pick a winner.";
 
+/// System prompt for the actual conversation (`ask_model`) — as opposed to
+/// `TAKE_SYSTEM`/`SCREEN_SYSTEM`, which each write one card's commentary from
+/// data already fetched. This is the one the user is actually talking to:
+/// real chat, tool calls when a question needs real numbers, same degen
+/// voice, same hard limits (no invented numbers, no buy/sell calls, no
+/// pretending it can sign anything itself).
+fn agent_system_prompt() -> String {
+    format!(
+        "You are Hyperium's Sushi agent — a crypto-market chatbot embedded in a desktop app. \
+Talk like a knowledgeable person having a normal conversation, not a press release and not \
+a try-hard crypto-twitter impression — no forced slang, no stacking emoji, no \"yo\"/\"fam\"/ \
+👀 filler in every line. A little personality and directness is good; sounding like you're \
+performing \"degen\" is not. If someone says \"how's it going\" or asks something with \
+nothing to do with crypto, just talk to them normally — do not force every reply into \
+market commentary, and do not refuse small talk. Save the tools for when a question \
+actually needs real data.
+
+Tools available: market_overview (whole crypto market via CoinGecko, 24h volume only), \
+screen_chain (what's trading on Robinhood Chain right now via Dexscreener, real 5m/1h/6h/24h \
+windows), lookup_token (everything on one Robinhood Chain ticker — works for ANY token \
+there, including ones minutes old — and is also what puts up the swap card the user can \
+act on), get_price and get_quote (restricted to this short curated whitelist only:\n{}\
+wallet_balance (the imported wallet's real on-chain balance of one token, read live — this \
+is the ONLY way you ever know what's in the wallet). Prefer screen_chain over \
+market_overview when Robinhood Chain is what's actually meant, since it has finer windows \
+market_overview structurally can't. Prefer lookup_token over get_price/get_quote for \
+anything not in that whitelist above — that's the common case, not the exception, for \
+tokens on this chain.
+
+If someone names two tokens and wants to swap between them and one isn't on the \
+get_price/get_quote whitelist, don't just refuse — call lookup_token on the one they want \
+to receive, and say plainly that swaps in this app run from WETH (there's no \"pick your \
+own input token\" yet), so what you can set up is WETH into that token, not a swap from \
+whatever they said they're holding.
+
+Never invent a number — every price, volume, quote, or balance in a reply came from one of \
+these tools this turn or a tool call earlier in the conversation, never from memory. This \
+includes any dollar conversion: wallet_balance returns a token amount, not a USD value — if \
+you're about to say a balance is \"worth about $X\" or do any other math that needs a live \
+price, call get_price/market_overview/lookup_token for that token FIRST, in the same turn, \
+and use the number that call returns. Do not convert using a price you remember or think \
+you know, even approximately, even for ETH — token prices move constantly and your training \
+data is stale by definition. If you can't get a live price, say the balance in the token \
+itself and say plainly that you don't have a live USD figure, rather than estimating one.
+
+Never tell anyone to buy or sell anything, never call a token safe, never rank tokens by \
+which is the better trade — you can describe a chart, not pick a winner. If asked what's in \
+the wallet or what it's worth, call wallet_balance for the specific token asked about rather \
+than guessing or deflecting — and if none is named, ask which one, or check the native ETH \
+balance as the obvious default. There is no balance/holdings view anywhere else in this \
+app's UI: never claim one exists or tell someone to go look for it there. If wallet_balance \
+itself fails or no wallet is imported, say that plainly instead of making something up.
+
+How swapping actually works here, if asked: type a ticker or say what to swap in plain \
+English; lookup_token puts up a card with a live preview of Sushi's route; hitting Swap \
+brings up an in-app confirmation panel showing the exact amount, recipient and gas, and \
+nothing is signed until that's explicitly confirmed there. You can explain all of this, \
+walk someone through it, and call the tools that get the right card on screen — but you \
+cannot click Swap or confirm anything yourself; that step is always the human's, done \
+outside this conversation, on purpose. If no wallet is imported yet, \"Import wallet\" is \
+in the bar above the message box — the key is encrypted on this machine and only a \
+short-lived signing process ever touches it, never this chat.",
+        tokens::catalog()
+    )
+}
+
 const DEFAULT_SLIPPAGE: f64 = 0.005;
+/// How long the amount field must sit still before a preview quote fires —
+/// long enough that typing "0.1" doesn't fire three requests for "0", "0.",
+/// "0.1".
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(450);
 const LOG_MAX: usize = 20;
 const MARKET_ROWS: usize = 10;
 const MARKET_TTL: Duration = Duration::from_secs(60);
@@ -138,7 +220,15 @@ enum Outcome {
     Market { rows: Vec<market::Row>, sort: market::Sort, limit: usize },
     /// A chat-requested read of the Robinhood Chain board — same data as the
     /// always-visible table, plus a take on the set as a whole.
-    Screen { rows: Vec<trending::Row>, take: String },
+    Screen { rows: Vec<trending::Row>, take: String, window: trending::Window },
+    /// A genuinely conversational turn from the tool-calling agent
+    /// (`ask_model`) — "how's it going", "what can you do", small talk, or
+    /// the tail end of a data question once the model has the numbers back.
+    /// `card` is whichever tool result (if any) the model called during this
+    /// turn, still the same `Outcome` shapes above so the same rendering
+    /// code shows it — the model never invents the numbers in `reply`, it's
+    /// just the one putting them into a sentence.
+    Chat { reply: String, card: Option<Box<Outcome>> },
 }
 
 /// What a completed swap actually did, re-read from the chain side rather
@@ -147,6 +237,7 @@ enum Outcome {
 struct SwapDone {
     tx_hash: String,
     sent: String,
+    sent_symbol: String,
     got_symbol: String,
     /// What the route promised before it was sent, not what actually landed —
     /// this build has no way to read the receipt's real output amount without
@@ -158,15 +249,15 @@ struct SwapDone {
 
 /// Every step a swap passes through, in order. Threaded back to the UI via
 /// `Arc<Mutex<SwapStep>>` rather than the channel, because the channel only
-/// carries a final result and this needs to update mid-flight, while Frame's
-/// window has the user's attention.
+/// carries a final result and this needs to update mid-flight, while the
+/// user's attention is on this app's own confirmation panel.
 #[derive(Clone, PartialEq)]
 enum SwapStep {
     Idle,
     Quoting,
     CheckingAllowance,
-    /// Frame is open waiting on the user; this is the step that can least
-    /// afford to look like the app has frozen.
+    /// The `PendingConfirm` panel is up and waiting on the user — the step
+    /// that can least afford to look like the app has frozen.
     WaitingOnApproval,
     ConfirmingApproval,
     WaitingOnSwap,
@@ -178,11 +269,24 @@ impl SwapStep {
             Self::Idle => "",
             Self::Quoting => "asking Sushi for a route",
             Self::CheckingAllowance => "checking allowance",
-            Self::WaitingOnApproval => "waiting for approval in Frame",
+            Self::WaitingOnApproval => "waiting for approval",
             Self::ConfirmingApproval => "confirming the approval on-chain",
-            Self::WaitingOnSwap => "waiting for the swap in Frame",
+            Self::WaitingOnSwap => "waiting for the swap",
         }
     }
+}
+
+/// A transaction the local-signer path has priced and gassed, waiting for
+/// the user to look at it before anything is signed. The background thread
+/// blocks on `reply` until the UI answers — that block, on a thread nothing
+/// else depends on, is the entire mechanism: no timers, no polling, just a
+/// human on the other end of a channel.
+struct PendingConfirm {
+    label: &'static str,
+    amount: String,
+    to: String,
+    estimated_fee_native: String,
+    reply: std::sync::mpsc::SyncSender<bool>,
 }
 
 impl Outcome {
@@ -203,8 +307,11 @@ impl Outcome {
 /// the sentence cannot possibly disagree with the card below it. Token and
 /// Screen already carry a written line of their own — the model's take — so
 /// this returns empty for both rather than saying the same thing twice.
+/// `Chat` already carries the model's own words in full, so it passes them
+/// through rather than trying to summarize them again.
 fn chat_reply(outcome: &Outcome) -> String {
     match outcome {
+        Outcome::Chat { reply, .. } => reply.clone(),
         Outcome::Price { chain, symbol, usd, .. } => {
             format!("{symbol} is at {} on {chain}.", market::money_price(*usd))
         }
@@ -252,41 +359,6 @@ struct ChatTurn {
     answer: ChatAnswer,
 }
 
-/// Compact recap of the last few turns, handed to the model ahead of a new
-/// question so "the second one" or "and that one's volume" has something to
-/// resolve against. Plain summaries, not the full card data — the model only
-/// ever needs enough to disambiguate what's being asked about, and Rust
-/// re-fetches real numbers for whatever it decides on regardless.
-fn chat_recap(chat: &[ChatTurn], max_turns: usize) -> String {
-    if chat.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from("Recent conversation, oldest first:\n");
-    for turn in chat.iter().rev().take(max_turns).collect::<Vec<_>>().into_iter().rev() {
-        let summary = match &turn.answer {
-            ChatAnswer::Result(Outcome::Token { info, .. }) => {
-                format!("looked up {} — ${}", info.symbol, info.price_usd)
-            }
-            ChatAnswer::Result(Outcome::Price { symbol, usd, .. }) => {
-                format!("{symbol} price — ${usd}")
-            }
-            ChatAnswer::Result(Outcome::Quote { quote, .. }) => {
-                format!("quoted {} to {}", quote.token_in.symbol, quote.token_out.symbol)
-            }
-            ChatAnswer::Result(Outcome::Screen { rows, .. }) => {
-                let names: Vec<&str> = rows.iter().take(5).map(|r| r.symbol.as_str()).collect();
-                format!("screened Robinhood Chain — top: {}", names.join(", "))
-            }
-            ChatAnswer::Result(Outcome::Market { rows, .. }) => {
-                format!("showed the wider market, {} rows", rows.len())
-            }
-            ChatAnswer::Error(e) => format!("error — {e}"),
-        };
-        out.push_str(&format!("Q: {}\nA: {summary}\n", turn.question));
-    }
-    out
-}
-
 pub struct SushiTool {
     ask: String,
     ticker: String,
@@ -310,6 +382,15 @@ pub struct SushiTool {
     /// ticker box and the ask box — land here, so "the second one" in a
     /// follow-up has something to mean.
     chat: Vec<ChatTurn>,
+    /// The same conversation, in the exact shape the Anthropic API wants it
+    /// back (`{"role": ..., "content": ...}`, including past `tool_use` /
+    /// `tool_result` blocks) — real history, not a hand-summarized recap, so
+    /// a follow-up has the model's own past reasoning to refer back to, not
+    /// just Rust's compressed guess at what mattered. Shared with the
+    /// background job directly (rather than shuttled back through a channel)
+    /// since only one `ask_model` call is ever in flight at a time — the
+    /// composer disables the input while busy.
+    agent_messages: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     log: Vec<LogLine>,
     market: Vec<market::Row>,
     market_rx: Option<Receiver<Result<Vec<market::Row>, String>>>,
@@ -322,13 +403,19 @@ pub struct SushiTool {
     trending_err: Option<String>,
     trending_at: Option<Instant>,
 
-    /// Frame's connected account. `None` covers both "never asked" and
-    /// "Frame isn't running" — the swap button's own click handler is what
-    /// distinguishes them, by trying to connect.
+    /// The imported wallet's address — `None` until a key is imported
+    /// (`signer::set_key`), either just now or on an earlier run
+    /// (`signer::address` is checked on load).
     wallet: Option<String>,
-    wallet_connecting: bool,
     wallet_err: Option<String>,
-    wallet_rx: Option<Receiver<Result<String, String>>>,
+    /// Edit buffer for pasting a private key to import. Kept apart from the
+    /// stored key so the import block doesn't vanish on the first keystroke.
+    wallet_key_input: String,
+    wallet_key_open: bool,
+    /// A transaction the local-signer path has priced and gassed, and is
+    /// blocked waiting on the user to look at before it signs anything. Set
+    /// by the swap-job thread, read and cleared by the UI thread.
+    pending_confirm: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
     /// How much of the base token (WETH) to put into the swap, as the user
     /// typed it — parsed against WETH's decimals only when the button is
     /// pressed, same as the quote box's amount field.
@@ -339,6 +426,37 @@ pub struct SushiTool {
     /// frame. Not a channel: a channel only delivers once the whole job ends,
     /// and this exists specifically to show what's happening before then.
     swap_step: std::sync::Arc<std::sync::Mutex<SwapStep>>,
+
+    /// Live "what would I get" preview, shown above the Swap button before
+    /// the user commits to anything — the route Sushi's aggregator would
+    /// take, re-quoted whenever the amount settles.
+    preview: Option<api::Quote>,
+    /// `Some("")` means "asked, nothing to show" (empty/zero amount) — kept
+    /// apart from a real error string, which the UI actually surfaces.
+    preview_err: Option<String>,
+    preview_rx: Option<Receiver<Result<api::Quote, String>>>,
+    /// (token out, source symbol, amount text) the current preview/err/
+    /// in-flight fetch answers — compared each frame to know when it's gone
+    /// stale (switching the source token counts as stale, same as an edited
+    /// amount).
+    preview_key: Option<(String, String, String)>,
+    /// When the amount field last settled on `preview_key`, so a fetch waits
+    /// out the debounce before firing.
+    preview_dirty_since: Option<Instant>,
+
+    /// What the connected wallet actually holds among the curated tokens —
+    /// candidates for the swap card's "from" picker. Empty until
+    /// `scan_wallet_holdings` answers; re-scanned when the wallet address
+    /// changes, not every frame — it's one RPC call per curated token.
+    holdings: Vec<Holding>,
+    holdings_rx: Option<Receiver<Vec<Holding>>>,
+    /// The wallet address `holdings` currently answers for — importing or
+    /// switching wallets is what triggers a re-scan, not every frame.
+    holdings_for: Option<String>,
+    /// Symbol of the token chosen as the swap's source. Defaults to WETH —
+    /// the one token every pool on this chain is guaranteed to pair against
+    /// — until the user picks something else from their own holdings.
+    source_symbol: String,
 }
 
 impl Default for SushiTool {
@@ -355,6 +473,7 @@ impl Default for SushiTool {
             busy_since: None,
             pending_question: None,
             chat: Vec::new(),
+            agent_messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             log: Vec::new(),
             market: Vec::new(),
             market_rx: None,
@@ -368,13 +487,25 @@ impl Default for SushiTool {
             trending_at: None,
 
             wallet: None,
-            wallet_connecting: false,
             wallet_err: None,
-            wallet_rx: None,
+            wallet_key_input: String::new(),
+            wallet_key_open: false,
+            pending_confirm: std::sync::Arc::new(std::sync::Mutex::new(None)),
             swap_amount: "0.01".into(),
             swap_rx: None,
             swap_result: None,
             swap_step: std::sync::Arc::new(std::sync::Mutex::new(SwapStep::Idle)),
+
+            preview: None,
+            preview_err: None,
+            preview_rx: None,
+            preview_key: None,
+            preview_dirty_since: None,
+
+            holdings: Vec::new(),
+            holdings_rx: None,
+            holdings_for: None,
+            source_symbol: "WETH".to_string(),
         }
     }
 }
@@ -387,30 +518,36 @@ fn sushi_key_path(cfg: &std::path::Path) -> std::path::PathBuf {
 /// change, volume, age, DEX — so the model reads exactly what the table below
 /// its take will show, not a differently-shaped summary that could disagree
 /// with it.
-fn screen_brief(rows: &[trending::Row]) -> String {
-    let mut out = String::from("Robinhood Chain, ranked by 24h volume:\n");
+fn screen_brief(rows: &[trending::Row], window: trending::Window) -> String {
+    let mut out = format!("Robinhood Chain, ranked by {} volume:\n", window.label());
     for r in rows {
         let age = r
             .age_hours()
             .map(|h| if h < 48.0 { format!("{h:.0}h old") } else { format!("{:.0}d old", h / 24.0) })
             .unwrap_or_else(|| "age unknown".into());
         let pct = |c: Option<f64>| c.map(|c| format!("{c:+.1}%")).unwrap_or_else(|| "n/a".into());
-        let mcap = r.market_cap.map(|m| format!("${m:.0}")).unwrap_or_else(|| "n/a".into());
+        let money = |m: Option<f64>| m.map(|m| format!("${m:.0}")).unwrap_or_else(|| "n/a".into());
         out.push_str(&format!(
-            "- {} · ${} · chg 1h {} / 24h {} · vol 1h ${:.0} / 6h ${:.0} / 24h ${:.0} · \
-             buys/sells 24h {}/{} · mcap {} · {} · {}\n",
+            "- {} · ${} · chg 5m {} / 1h {} / 24h {} · vol 5m ${:.0} / 1h ${:.0} / 6h ${:.0} / \
+             24h ${:.0} · buys/sells 5m {}/{} · 24h {}/{} · mcap {} · fdv {} · {} · {}{}\n",
             r.symbol,
             r.price_usd,
+            pct(r.change_m5),
             pct(r.change_h1),
             pct(r.change_h24),
+            r.volume_m5,
             r.volume_h1,
             r.volume_h6,
             r.volume_h24,
+            r.buys_m5,
+            r.sells_m5,
             r.buys_h24,
             r.sells_h24,
-            mcap,
+            money(r.market_cap),
+            money(r.fdv),
             age,
-            r.dex_id
+            r.dex_id,
+            if r.labels.is_empty() { String::new() } else { format!(" · {}", r.labels.join(",")) },
         ));
     }
     out
@@ -435,17 +572,17 @@ fn run(intent: Intent, api_key: &str, ai_key: &str) -> Result<Outcome, String> {
         Intent::Market { sort, limit } => {
             Ok(Outcome::Market { rows: market::fetch(sort, limit)?, sort, limit })
         }
-        Intent::ChainScreen { limit } => {
-            let rows = trending::fetch(limit)?;
+        Intent::ChainScreen { limit, window } => {
+            let rows = trending::fetch(limit, window)?;
             let take = if ai_key.trim().is_empty() {
                 String::new()
             } else {
                 use crate::llm::LlmProvider;
                 crate::llm::Anthropic::new(ai_key.to_string())
-                    .complete(SCREEN_SYSTEM, &screen_brief(&rows))
+                    .complete(SCREEN_SYSTEM, &screen_brief(&rows, window))
                     .unwrap_or_else(|e| format!("(no read: {e})"))
             };
-            Ok(Outcome::Screen { rows, take })
+            Ok(Outcome::Screen { rows, take, window })
         }
         Intent::Price { chain, token } => {
             let usd = api::price(chain.id, token.address, api_key)?;
@@ -472,20 +609,312 @@ fn run(intent: Intent, api_key: &str, ai_key: &str) -> Result<Outcome, String> {
     }
 }
 
+/// The tool set `ask_model` hands to Anthropic. Every schema here is what
+/// actually gets validated on Anthropic's side before `dispatch_tool` ever
+/// sees an `input` — there's no free-text JSON to parse or get subtly wrong.
+fn agent_tools() -> Vec<crate::llm::ToolSpec> {
+    use serde_json::json;
+    vec![
+        crate::llm::ToolSpec {
+            name: "market_overview",
+            description: "The whole crypto market (CoinGecko) — what's pumping, biggest \
+                coins, top movers, with no chain named. 24h-granularity only; CoinGecko \
+                doesn't expose anything finer across the whole market.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "sort": {
+                        "type": "string",
+                        "enum": ["volume", "market_cap", "gainers", "losers"],
+                        "description": "volume/market_cap = biggest right now; gainers/losers = biggest 24h movers"
+                    },
+                    "limit": { "type": "integer", "description": "default 10, max 50" }
+                }
+            }),
+        },
+        crate::llm::ToolSpec {
+            name: "screen_chain",
+            description: "What's actually trading on Robinhood Chain right now \
+                (Dexscreener), ranked by volume. Use for \"on Robinhood\", \"this chain\", \
+                \"what just launched\", \"what's hot right now\" — unlike market_overview \
+                this has real 5m/1h/6h/24h windows.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "description": "default 20, max 30" },
+                    "window": {
+                        "type": "string",
+                        "enum": ["m5", "h1", "h6", "h24"],
+                        "description": "m5 for \"right now\"/\"last 5 minutes\", h1 for \"the last hour\", h24 (default) for \"today\""
+                    }
+                }
+            }),
+        },
+        crate::llm::ToolSpec {
+            name: "lookup_token",
+            description: "Everything known about one specific ticker trading on Robinhood \
+                Chain — price, every volume/change window, liquidity, market cap, FDV, \
+                buy/sell pressure, pool age, socials. Works for ANY token on this chain, \
+                including ones launched minutes ago. This is also what puts up the swap \
+                card the user can act on, so call it whenever they name a token they \
+                might want to swap into.",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "ticker": { "type": "string" } },
+                "required": ["ticker"]
+            }),
+        },
+        crate::llm::ToolSpec {
+            name: "get_price",
+            description: "One specific token's USD price — but ONLY for a short curated \
+                list of well-known tokens on major chains (Ethereum, Base, etc). For \
+                anything on Robinhood Chain, or any ticker not in that short list, use \
+                lookup_token instead.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "chain": { "type": "string", "description": "defaults to Ethereum if not stated" },
+                    "token": { "type": "string" }
+                },
+                "required": ["token"]
+            }),
+        },
+        crate::llm::ToolSpec {
+            name: "get_quote",
+            description: "Preview exchange rate between two tokens — but ONLY for the same \
+                short curated list as get_price. For Robinhood Chain tokens, use \
+                lookup_token on the token the user wants instead; that surfaces a real \
+                swap card, this tool doesn't.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "chain": { "type": "string" },
+                    "token_in": { "type": "string" },
+                    "token_out": { "type": "string" },
+                    "amount": { "type": "string", "description": "plain decimal string of the input token, e.g. \"0.5\"" }
+                },
+                "required": ["token_in", "token_out", "amount"]
+            }),
+        },
+        crate::llm::ToolSpec {
+            name: "wallet_balance",
+            description: "The imported wallet's real on-chain balance of one token on \
+                Robinhood Chain, read directly from the chain (never from memory, never \
+                estimated). Leave ticker empty or use \"ETH\" for the native balance. \
+                Fails cleanly if no wallet is imported yet.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "ticker": { "type": "string", "description": "empty or \"ETH\" for native; any ticker on Robinhood Chain otherwise" }
+                }
+            }),
+        },
+    ]
+}
+
+/// Flattens an `Outcome` into the text a model reads back as a `tool_result`
+/// — same numbers the card will show, phrased as plain text instead of
+/// widget layout, so the model's final reply can't disagree with the card
+/// underneath it.
+fn tool_result_text(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Token { info, .. } => info.brief(),
+        Outcome::Screen { rows, window, .. } => screen_brief(rows, *window),
+        Outcome::Market { rows, sort, limit } => {
+            let mut out = format!("Whole crypto market, ranked by {}:\n", sort.label());
+            for r in rows.iter().take(*limit) {
+                let chg = r.change_24h.map(|c| format!("{c:+.2}%")).unwrap_or_else(|| "n/a".into());
+                out.push_str(&format!(
+                    "- {} · {} · 24h {chg}\n",
+                    r.symbol,
+                    market::money_price(r.price),
+                ));
+            }
+            out
+        }
+        Outcome::Price { chain, symbol, address, usd } => {
+            format!("{symbol} on {chain} ({address}) = {}", market::money_price(*usd))
+        }
+        Outcome::Quote { chain, quote } => {
+            let (sent, got) = Outcome::legs(quote);
+            format!(
+                "{sent} {} -> {got} {} on {chain} (status: {})",
+                quote.token_in.symbol,
+                quote.token_out.symbol,
+                quote.status,
+            )
+        }
+        Outcome::Chat { reply, .. } => reply.clone(),
+    }
+}
+
+/// Runs one tool call and reports what happened two ways: the text the model
+/// reads back (`tool_result` content), and — when the call actually pulled
+/// real data — the same `Outcome` shape the rest of the UI already knows how
+/// to render, stashed in `last_card` for `ask_model` to attach to the turn's
+/// final reply. Only the last successful call in a turn survives there:
+/// one card per turn is the existing UX, same as before this was a tool loop.
+/// Reads a balance straight off the chain — never from anywhere else. `ETH`/
+/// `native`/empty reads the chain's native balance (`eth_getBalance`);
+/// anything else resolves an ERC-20 address (the curated quote tokens first,
+/// then Dexscreener for anything else, same as `lookup_token`), reads its
+/// `decimals()` (falling back to 18 if that call fails — most tokens are 18,
+/// and a wrong balance from a wrong decimals guess is still better than no
+/// answer at all, clearly hedged as a fallback rather than presented as
+/// exact), and calls `balanceOf`.
+fn wallet_balance_text(wallet: Option<&str>, ticker: &str) -> String {
+    fn inner(owner: &str, ticker: &str) -> Result<String, String> {
+        let ticker = ticker.trim().trim_start_matches('$');
+        let chain_id = 4663; // Robinhood Chain — the only chain a local wallet is imported for
+        if ticker.is_empty() || ticker.eq_ignore_ascii_case("ETH") || ticker.eq_ignore_ascii_case("native")
+        {
+            let raw = chain_rpc::native_balance(chain_id, owner)?;
+            return Ok(format!("{} ETH", tokens::format_units(raw, 18)));
+        }
+        let (address, decimals) =
+            match tokens::chain_by_name(trending::CHAIN_NAME).and_then(|c| c.token(ticker)) {
+                Some(t) => (t.address.to_string(), t.decimals),
+                None => {
+                    let info = trending::lookup(ticker)?;
+                    let decimals = chain_rpc::eth_call(chain_id, &info.address, erc20::DECIMALS_CALL)
+                        .map(|hex| erc20::decode_uint256(&hex) as u32)
+                        .unwrap_or(18);
+                    (info.address, decimals)
+                }
+            };
+        let call_data = erc20::encode_balance_of(owner)?;
+        let hex = chain_rpc::eth_call(chain_id, &address, &call_data)?;
+        Ok(format!(
+            "{} {}",
+            tokens::format_units(erc20::decode_uint256(&hex), decimals),
+            ticker.to_uppercase()
+        ))
+    }
+    match wallet {
+        None => "no wallet imported yet — the user needs to click \"Import wallet\" first".to_string(),
+        Some(owner) => match inner(owner, ticker) {
+            Ok(s) => s,
+            Err(e) => format!("error: {e}"),
+        },
+    }
+}
+
+/// One curated-registry token the wallet holds a nonzero balance of — the
+/// candidate list for the swap card's "from" picker, built by asking the
+/// chain directly rather than through any indexer. Scoped to the curated
+/// list on purpose, the same reason `tokens.rs` exists: a token this app
+/// doesn't already know isn't offered as a swap source without being looked
+/// up first.
+#[derive(Clone)]
+struct Holding {
+    symbol: &'static str,
+    address: &'static str,
+    decimals: u32,
+    balance_raw: u128,
+}
+
+fn scan_wallet_holdings(owner: &str) -> Vec<Holding> {
+    let Some(chain) = tokens::chain_by_name(trending::CHAIN_NAME) else { return Vec::new() };
+    // Native ETH first, checked separately from the curated list below: it
+    // deliberately has no `tokens.rs` entry for this chain (a price lookup
+    // 404s on the NATIVE sentinel, even though quotes and swaps route fine
+    // through it), so it would never otherwise show up as something the
+    // wallet can swap from — even when it's the only thing the wallet holds.
+    let native = chain_rpc::native_balance(chain.id, owner).ok().filter(|&b| b > 0).map(|balance_raw| {
+        Holding { symbol: "ETH", address: tokens::NATIVE, decimals: 18, balance_raw }
+    });
+    native
+        .into_iter()
+        .chain(chain.tokens.iter().filter_map(|t| {
+            let call_data = erc20::encode_balance_of(owner).ok()?;
+            let hex = chain_rpc::eth_call(chain.id, t.address, &call_data).ok()?;
+            let balance_raw = erc20::decode_uint256(&hex);
+            (balance_raw > 0).then_some(Holding {
+                symbol: t.symbol,
+                address: t.address,
+                decimals: t.decimals,
+                balance_raw,
+            })
+        }))
+        .collect()
+}
+
+/// Resolves the swap's chosen source symbol to an (address, decimals) pair —
+/// native ETH as a special case `Chain::token` can never answer, since
+/// Robinhood Chain's curated list has no entry for it (see
+/// `scan_wallet_holdings`), and everything else through the normal
+/// curated-registry lookup.
+fn resolve_source_token(chain: &'static tokens::Chain, symbol: &str) -> Option<(&'static str, u32)> {
+    if symbol.eq_ignore_ascii_case("ETH") {
+        return Some((tokens::NATIVE, 18));
+    }
+    chain.token(symbol).map(|t| (t.address, t.decimals))
+}
+
+fn dispatch_tool(
+    name: &str,
+    input: &serde_json::Value,
+    api_key: &str,
+    wallet: Option<&str>,
+    last_card: &std::cell::RefCell<Option<Outcome>>,
+) -> String {
+    if name == "wallet_balance" {
+        return wallet_balance_text(wallet, input["ticker"].as_str().unwrap_or(""));
+    }
+    let result: Result<Outcome, String> = match name {
+        "market_overview" => {
+            let sort = input["sort"].as_str().and_then(market::Sort::parse).unwrap_or(market::Sort::Volume);
+            let limit = input["limit"].as_u64().unwrap_or(10).clamp(1, market::LIMIT_MAX as u64) as usize;
+            run(Intent::Market { sort, limit }, api_key, "")
+        }
+        "screen_chain" => {
+            let limit = input["limit"].as_u64().unwrap_or(20).clamp(1, intent::SCREEN_LIMIT_MAX as u64) as usize;
+            let window = input["window"].as_str().and_then(trending::Window::parse).unwrap_or(trending::Window::H24);
+            run(Intent::ChainScreen { limit, window }, api_key, "")
+        }
+        "lookup_token" => {
+            let ticker = input["ticker"].as_str().unwrap_or_default().trim().trim_start_matches('$').to_string();
+            if ticker.is_empty() {
+                Err("no ticker given".to_string())
+            } else {
+                run(Intent::TokenLookup { ticker }, api_key, "")
+            }
+        }
+        "get_price" => (|| {
+            let chain = intent::chain_of(input)?;
+            let token = intent::token_of(chain, input, "token")?;
+            run(Intent::Price { chain, token }, api_key, "")
+        })(),
+        "get_quote" => intent::quote_of(input).and_then(|i| run(i, api_key, "")),
+        other => Err(format!("unknown tool {other}")),
+    };
+    match result {
+        Ok(outcome) => {
+            let text = tool_result_text(&outcome);
+            *last_card.borrow_mut() = Some(outcome);
+            text
+        }
+        Err(e) => format!("error: {e}"),
+    }
+}
+
 /// Approvals typically land in one or two blocks; five minutes is generous
 /// headroom for a slow one without leaving the UI waiting indefinitely on a
 /// stuck one.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 /// "Infinite" approval — the standard practice so the same token doesn't ask
 /// to be approved again on the next swap. The user sees exactly this amount
-/// named in Frame's own confirmation before it's signed.
+/// in the confirmation panel before it's signed.
 const MAX_APPROVAL: u128 = u128::MAX;
 
-/// The whole swap sequence, off the UI thread. Every step that could fail is
-/// reported through `Result`; every step that needs the user is a call into
-/// `wallet::`, which is the only place a signature can happen.
+/// The whole swap sequence, off the UI thread: quote, allowance check, an
+/// approval if one is needed (with a wait for it to actually be mined before
+/// the next step trusts it), then the swap itself. Every read goes straight
+/// to the chain's own RPC (`chain_rpc`), and every signature is preceded by
+/// a `PendingConfirm` the UI has to explicitly answer before this ever
+/// reaches for `signer::sign_via_worker` — the only place a key is touched.
 #[allow(clippy::too_many_arguments)]
-fn run_swap_job(
+fn run_local_swap_job(
     chain_id: u64,
     token_in: &str,
     token_out: &str,
@@ -494,6 +923,7 @@ fn run_swap_job(
     api_key: &str,
     symbol: String,
     set_step: impl Fn(SwapStep),
+    pending: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
 ) -> Result<SwapDone, String> {
     set_step(SwapStep::Quoting);
     let swap = api::swap(
@@ -507,52 +937,112 @@ fn run_swap_job(
         },
         api_key,
     )?;
-    if swap.status == "Partial" {
-        // Not fatal — Sushi found a route that fills less than the full
-        // amount — but worth surfacing rather than silently swapping less
-        // than the user typed.
-    }
 
-    // The native token needs no allowance — there is nothing to approve
-    // spending, since it moves as `value`, not as an ERC-20 transfer.
     let is_native = token_in.eq_ignore_ascii_case(tokens::NATIVE);
     if !is_native {
         set_step(SwapStep::CheckingAllowance);
         let call_data = erc20::encode_allowance(sender, &swap.tx.to)?;
-        let raw = wallet::call(chain_id, token_in, &call_data)?;
+        let raw = chain_rpc::eth_call(chain_id, token_in, &call_data)?;
         let current = erc20::decode_uint256(&raw);
 
         if current < amount_in {
             set_step(SwapStep::WaitingOnApproval);
             let approve_data = erc20::encode_approve(&swap.tx.to, MAX_APPROVAL)?;
-            let approve_hash = wallet::send_transaction(&wallet::TxRequest {
+            let approve_hash = local_send_transaction(
                 chain_id,
-                from: sender.to_string(),
-                to: token_in.to_string(),
-                data: approve_data,
-                value: 0,
-            })?;
+                sender,
+                token_in,
+                &approve_data,
+                0,
+                "Approve token spending",
+                format!("infinite {} allowance", swap.token_in.symbol),
+                &pending,
+            )?;
             set_step(SwapStep::ConfirmingApproval);
-            wallet::wait_for_receipt(chain_id, &approve_hash, APPROVAL_TIMEOUT)?;
+            chain_rpc::wait_for_receipt(chain_id, &approve_hash, APPROVAL_TIMEOUT)?;
         }
     }
 
     set_step(SwapStep::WaitingOnSwap);
-    let tx_hash = wallet::send_transaction(&wallet::TxRequest {
+    let amount_display = format!(
+        "{} {}",
+        market::token_amount(&tokens::format_units(swap.amount_in, swap.token_in.decimals)),
+        swap.token_in.symbol
+    );
+    let tx_hash = local_send_transaction(
         chain_id,
-        from: sender.to_string(),
-        to: swap.tx.to.clone(),
-        data: swap.tx.data.clone(),
-        value: swap.tx.value,
-    })?;
+        sender,
+        &swap.tx.to,
+        &swap.tx.data,
+        swap.tx.value,
+        "Swap",
+        amount_display,
+        &pending,
+    )?;
 
     Ok(SwapDone {
         tx_hash,
         sent: tokens::format_units(swap.amount_in, swap.token_in.decimals),
+        sent_symbol: swap.token_in.symbol,
         expected_out: tokens::format_units(swap.amount_out, swap.token_out.decimals),
         price_impact: swap.price_impact,
         got_symbol: if symbol.is_empty() { swap.token_out.symbol } else { symbol },
     })
+}
+
+/// Prices gas, parks the transaction in `pending` for the UI to show, and
+/// blocks until it's answered — cancelled, timed out (ten minutes: long
+/// enough that stepping away doesn't auto-cancel, short enough that a
+/// forgotten prompt doesn't leak a thread forever), or confirmed, in which
+/// case only then does this reach for `signer::sign_via_worker`.
+#[allow(clippy::too_many_arguments)]
+fn local_send_transaction(
+    chain_id: u64,
+    from: &str,
+    to: &str,
+    data: &str,
+    value: u128,
+    label: &'static str,
+    amount_display: String,
+    pending: &std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
+) -> Result<String, String> {
+    let nonce = chain_rpc::nonce(chain_id, from)?;
+    let fees = chain_rpc::fees(chain_id)?;
+    let gas_limit = chain_rpc::estimate_gas(chain_id, from, to, data, value)?;
+    let fee_native = (gas_limit as u128 * fees.max_fee_per_gas) as f64 / 1e18;
+
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+    *pending.lock().unwrap() = Some(PendingConfirm {
+        label,
+        amount: amount_display,
+        to: to.to_string(),
+        estimated_fee_native: format!("~{fee_native:.6} ETH"),
+        reply: reply_tx,
+    });
+
+    let confirmed = match reply_rx.recv_timeout(Duration::from_secs(600)) {
+        Ok(v) => v,
+        Err(_) => {
+            *pending.lock().unwrap() = None;
+            return Err("confirmation timed out — nothing was signed".into());
+        }
+    };
+    if !confirmed {
+        return Err("cancelled".into());
+    }
+
+    let unsigned = signer::UnsignedTx {
+        chain_id,
+        nonce,
+        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+        max_fee_per_gas: fees.max_fee_per_gas,
+        gas_limit,
+        to: to.to_string(),
+        value,
+        data: data.to_string(),
+    };
+    let signed = signer::sign_via_worker(&unsigned)?;
+    chain_rpc::send_raw_transaction(chain_id, &signed)
 }
 
 impl SushiTool {
@@ -591,44 +1081,29 @@ impl SushiTool {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(trending::fetch(TRENDING_ROWS));
+            let _ = tx.send(trending::fetch(TRENDING_ROWS, trending::Window::H24));
         });
         self.trending_rx = Some(rx);
         ctx.request_repaint();
     }
 
-    /// Asks Frame for the connected account. Runs on a worker thread since
-    /// Frame may prompt the user and the reply can take a while — the same
-    /// reason every other network call in this file is threaded. Its own
-    /// channel rather than reusing `self.rx`: connecting is not an `Outcome`,
-    /// and this way a wallet error can never land in a ticker lookup's card.
-    fn connect_wallet(&mut self, ctx: &egui::Context) {
-        if self.wallet_connecting {
-            return;
-        }
-        self.wallet_connecting = true;
-        self.wallet_err = None;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(wallet::accounts());
-        });
-        self.wallet_rx = Some(rx);
-        ctx.request_repaint();
-    }
-
     /// The whole swap, start to finish, on one worker thread: quote, allowance
     /// check, an approval if one is needed (with a wait for it to actually be
-    /// mined before the next step trusts it), then the swap itself. Every
-    /// signature happens inside Frame's own window — this thread only ever
-    /// asks, it never holds a key.
+    /// mined before the next step trusts it), then the swap itself, all
+    /// against the chain's own RPC. Every signature is preceded by an
+    /// in-app `PendingConfirm` the UI has to answer before this thread
+    /// reaches for `signer.rs` — the only place a key is touched.
     fn run_swap(&mut self, symbol: String, token_out_address: String, ctx: &egui::Context) {
         if self.swap_rx.is_some() {
             return;
         }
         let Some(sender) = self.wallet.clone() else { return };
         let Some(robinhood) = tokens::chain_by_name(trending::CHAIN_NAME) else { return };
-        let Some(weth) = robinhood.token("WETH") else { return };
-        let amount_raw = match tokens::parse_units(self.swap_amount.trim(), weth.decimals) {
+        let Some((source_address, source_decimals)) = resolve_source_token(robinhood, &self.source_symbol)
+        else {
+            return;
+        };
+        let amount_raw = match tokens::parse_units(self.swap_amount.trim(), source_decimals) {
             Ok(0) => {
                 self.swap_result = Some(Err("amount is zero".into()));
                 return;
@@ -641,14 +1116,15 @@ impl SushiTool {
         };
 
         let chain_id = robinhood.id;
-        let token_in = weth.address.to_string();
+        let token_in = source_address.to_string();
         let api_key = self.sushi_key.clone();
         let step = self.swap_step.clone();
         let set = move |s: SwapStep| *step.lock().unwrap() = s;
+        let pending = self.pending_confirm.clone();
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(run_swap_job(
+            let result = run_local_swap_job(
                 chain_id,
                 &token_in,
                 &token_out_address,
@@ -657,11 +1133,162 @@ impl SushiTool {
                 &api_key,
                 symbol,
                 set,
-            ));
+                pending,
+            );
+            let _ = tx.send(result);
         });
         self.swap_rx = Some(rx);
         self.swap_result = None;
         ctx.request_repaint();
+    }
+
+    /// The local-signer path's entire safety net: nothing gets signed until
+    /// this is answered. Modal on purpose — the rest of the panel is
+    /// unreachable while a transaction is waiting.
+    fn confirm_modal(&mut self, ctx: &egui::Context) {
+        // Snapshot out of the mutex before drawing anything — the reply
+        // sender clones cheaply (it's a handle, not the channel itself), so
+        // nothing here needs to hold the lock across a closure the borrow
+        // checker can't see into.
+        let snapshot = {
+            let guard = self.pending_confirm.lock().unwrap();
+            guard.as_ref().map(|p| {
+                (p.label, p.amount.clone(), p.to.clone(), p.estimated_fee_native.clone(), p.reply.clone())
+            })
+        };
+        let Some((label, amount, to, fee, reply)) = snapshot else { return };
+
+        let mut decision: Option<bool> = None;
+        egui::Modal::new(egui::Id::new("sushi_local_confirm")).show(ctx, |ui| {
+            ui.set_max_width(360.0);
+            // `Modal`'s own backdrop doesn't reliably pick up this app's dark
+            // theme — without an explicit fill here, the light text below
+            // (styled for the dark cards used everywhere else) can land on
+            // whatever light default background the modal falls back to.
+            egui::Frame::default()
+                .fill(BG_ELEVATED)
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(label).color(ACCENT).strong());
+                    ui.add_space(10.0);
+                    row(ui, "Amount", &amount);
+                    row(ui, "To", &short_addr(&to));
+                    row(ui, "Est. network fee", &fee);
+                    ui.add_space(14.0);
+                    ui.label(
+                        RichText::new(
+                            "Signed locally with your imported key — nothing else can see it.",
+                        )
+                        .color(FAINT)
+                        .small(),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if tool_button(ui, "Cancel", true) {
+                            decision = Some(false);
+                        }
+                        if tool_button(ui, "Confirm & Sign", true) {
+                            decision = Some(true);
+                        }
+                    });
+                });
+        });
+
+        if let Some(d) = decision {
+            let _ = reply.try_send(d);
+            *self.pending_confirm.lock().unwrap() = None;
+        }
+    }
+
+    /// Re-quotes the swap amount against Sushi's router a short beat after
+    /// the field stops changing, so the amount/button row always has a real
+    /// "what would I get" underneath it instead of asking the user to click
+    /// Swap to find out. Keyed on (token, amount text): switching to a fresh
+    /// lookup or editing the amount drops the stale answer immediately
+    /// rather than showing yesterday's numbers under a new question.
+    fn maybe_preview_quote(&mut self, token_out: &str, ctx: &egui::Context) {
+        let amount = self.swap_amount.trim().to_string();
+        let key = (token_out.to_string(), self.source_symbol.clone(), amount.clone());
+        if self.preview_key.as_ref() != Some(&key) {
+            self.preview_key = Some(key);
+            self.preview = None;
+            self.preview_err = None;
+            self.preview_rx = None;
+            self.preview_dirty_since = Some(Instant::now());
+        }
+        if self.preview_rx.is_some() || self.preview.is_some() || self.preview_err.is_some() {
+            return;
+        }
+        let Some(since) = self.preview_dirty_since else { return };
+        let elapsed = since.elapsed();
+        if elapsed < PREVIEW_DEBOUNCE {
+            ctx.request_repaint_after(PREVIEW_DEBOUNCE - elapsed);
+            return;
+        }
+
+        let Some(robinhood) = tokens::chain_by_name(trending::CHAIN_NAME) else { return };
+        let Some((source_address, source_decimals)) = resolve_source_token(robinhood, &self.source_symbol)
+        else {
+            return;
+        };
+        let amount_raw = match tokens::parse_units(&amount, source_decimals) {
+            Ok(v) if v > 0 => v,
+            // Empty, zero or unparseable: nothing to preview. Stamped as a
+            // silent "asked" marker so this stops re-parsing every frame
+            // until the amount actually changes again.
+            _ => {
+                self.preview_err = Some(String::new());
+                return;
+            }
+        };
+
+        let chain_id = robinhood.id;
+        let token_in = source_address.to_string();
+        let token_out = token_out.to_string();
+        let api_key = self.sushi_key.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(api::quote(
+                &api::QuoteRequest {
+                    chain_id,
+                    token_in,
+                    token_out,
+                    amount: amount_raw,
+                    max_slippage: DEFAULT_SLIPPAGE,
+                },
+                &api_key,
+            ));
+        });
+        self.preview_rx = Some(rx);
+        ctx.request_repaint();
+    }
+
+    /// Scans the wallet's balance across the curated token list once per
+    /// wallet address (import or switch), not every frame — the "from"
+    /// picker just reads whatever `holdings` last resolved to, stale by at
+    /// most one scan's worth of chain state.
+    fn maybe_fetch_holdings(&mut self, ctx: &egui::Context) {
+        let Some(owner) = self.wallet.clone() else { return };
+        if let Some(rx) = &self.holdings_rx {
+            if let Ok(list) = rx.try_recv() {
+                self.holdings = list;
+                self.holdings_rx = None;
+            }
+            return;
+        }
+        if self.holdings_for.as_deref() == Some(owner.as_str()) {
+            return;
+        }
+        self.holdings_for = Some(owner.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let list = scan_wallet_holdings(&owner);
+            let _ = tx.send(list);
+            ctx.request_repaint();
+        });
+        self.holdings_rx = Some(rx);
     }
 
     /// Ticker in, numbers and a reading out.
@@ -686,10 +1313,12 @@ impl SushiTool {
         });
     }
 
-    /// Natural language path: model parses, Rust resolves and runs. Recent
-    /// turns ride along as context, so a follow-up like "and the second one"
-    /// has something to resolve against — the model only ever uses that to
-    /// decide *what* to look up, never to invent an answer on its own.
+    /// Natural language path: a real tool-calling conversation, not a
+    /// classify-then-execute step. Real message history (`agent_messages`)
+    /// rides along, not a hand-summarized recap, so a follow-up like "and
+    /// the second one" has the model's own past turns to resolve against.
+    /// The model decides when a question needs a tool; every number in its
+    /// final reply came out of one, never out of the model's own memory.
     fn ask_model(&mut self, ctx: &egui::Context) {
         let question = self.ask.trim().to_string();
         if question.is_empty() {
@@ -698,12 +1327,23 @@ impl SushiTool {
         self.ask.clear();
         let ai_key = self.ai_key.clone();
         let api_key = self.sushi_key.clone();
-        let prompt = format!("{}New question: {question}", chat_recap(&self.chat, 3));
-        self.spawn(ctx, question, move || {
-            use crate::llm::LlmProvider;
-            let raw = crate::llm::Anthropic::new(ai_key.clone())
-                .complete(&intent::system_prompt(), &prompt)?;
-            run(intent::parse(&raw)?, &api_key, &ai_key)
+        let wallet = self.wallet.clone();
+        let messages = self.agent_messages.clone();
+        self.spawn(ctx, question.clone(), move || {
+            let last_card = std::cell::RefCell::new(None);
+            // Sonnet, not the default Haiku: this agent has to reliably call a
+            // tool for every number rather than answer from memory, and Haiku
+            // was caught doing exactly that (a guessed ETH/USD conversion).
+            let anthropic = crate::llm::Anthropic::new(ai_key).with_model("claude-sonnet-5");
+            let tools = agent_tools();
+            let mut guard = messages.lock().unwrap();
+            guard.push(serde_json::json!({ "role": "user", "content": question }));
+            let system = agent_system_prompt();
+            let reply = anthropic.converse(&system, &mut guard, &tools, |name, input| {
+                dispatch_tool(name, input, &api_key, wallet.as_deref(), &last_card)
+            })?;
+            drop(guard);
+            Ok(Outcome::Chat { reply, card: last_card.into_inner().map(Box::new) })
         });
     }
 
@@ -731,6 +1371,14 @@ impl SushiTool {
             Ok(Outcome::Screen { rows, .. }) => {
                 (format!("screened {} Robinhood Chain tokens", rows.len()), true)
             }
+            Ok(Outcome::Chat { card, .. }) => (
+                match card.as_deref() {
+                    Some(Outcome::Token { info, .. }) => format!("chatted, read {}", info.symbol),
+                    Some(_) => "chatted, pulled data".to_string(),
+                    None => "chatted".to_string(),
+                },
+                true,
+            ),
             Err(e) => (e.clone(), false),
         };
         self.log.insert(0, LogLine { at: Instant::now(), text, ok });
@@ -793,26 +1441,6 @@ impl SushiTool {
                 Err(TryRecvError::Disconnected) => self.trending_rx = None,
             }
         }
-        if let Some(rx) = &self.wallet_rx {
-            match rx.try_recv() {
-                Ok(Ok(address)) => {
-                    self.wallet = Some(address);
-                    self.wallet_err = None;
-                    self.wallet_connecting = false;
-                    self.wallet_rx = None;
-                }
-                Ok(Err(e)) => {
-                    self.wallet_err = Some(e);
-                    self.wallet_connecting = false;
-                    self.wallet_rx = None;
-                }
-                Err(TryRecvError::Empty) => ui.ctx().request_repaint(),
-                Err(TryRecvError::Disconnected) => {
-                    self.wallet_connecting = false;
-                    self.wallet_rx = None;
-                }
-            }
-        }
         if let Some(rx) = &self.swap_rx {
             match rx.try_recv() {
                 Ok(result) => {
@@ -825,6 +1453,22 @@ impl SushiTool {
                     *self.swap_step.lock().unwrap() = SwapStep::Idle;
                     self.swap_rx = None;
                 }
+            }
+        }
+        if let Some(rx) = &self.preview_rx {
+            match rx.try_recv() {
+                Ok(Ok(q)) => {
+                    self.preview = Some(q);
+                    self.preview_err = None;
+                    self.preview_rx = None;
+                }
+                Ok(Err(e)) => {
+                    self.preview_err = Some(e);
+                    self.preview = None;
+                    self.preview_rx = None;
+                }
+                Err(TryRecvError::Empty) => ui.ctx().request_repaint(),
+                Err(TryRecvError::Disconnected) => self.preview_rx = None,
             }
         }
     }
@@ -928,7 +1572,7 @@ impl Tool for SushiTool {
         "Sushi agent"
     }
     fn about(&self) -> &'static str {
-        "What's moving, and what a swap would give you. Read-only."
+        "Tell it what to swap — it prices the best route through Sushi and shows you before you sign."
     }
     fn uses_output_dir(&self) -> bool {
         false
@@ -938,6 +1582,9 @@ impl Tool for SushiTool {
         if !self.loaded {
             self.ai_key = crate::secret::load_secret(&octx.config_dir.join("anthropic.key"));
             self.sushi_key = crate::secret::load_secret(&sushi_key_path(octx.config_dir));
+            // No "connect" handshake needed — if a key's already imported,
+            // the wallet is simply already here.
+            self.wallet = signer::address(octx.config_dir);
             self.loaded = true;
             let ctx = ui.ctx().clone();
             self.refresh_market(&ctx);
@@ -945,6 +1592,10 @@ impl Tool for SushiTool {
         }
 
         self.poll(ui);
+        self.confirm_modal(ui.ctx());
+        if self.pending_confirm.lock().unwrap().is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
 
         // Keep the table warm without the user asking.
         let stale = self.market_at.map(|t| t.elapsed() >= MARKET_TTL).unwrap_or(false);
@@ -960,11 +1611,25 @@ impl Tool for SushiTool {
         if self.market_at.is_some() || self.trending_at.is_some() {
             ui.ctx().request_repaint_after(Duration::from_secs(1));
         }
+        self.maybe_fetch_holdings(&ui.ctx().clone());
 
-        // The agent leads. Everything below it is the reference material you
-        // consult after asking, not before.
+        // The composer is pinned to the bottom of the panel, chat-app style —
+        // it needs to be claimed before the scroll area below so it always
+        // gets its strip regardless of how tall the conversation grows.
+        egui::Panel::bottom("sushi_composer")
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(0, 10)))
+            .show_separator_line(true)
+            .show_inside(ui, |ui| {
+                self.composer(ui, octx);
+            });
+
+        // The conversation leads. Everything below it is the reference
+        // material you consult after asking, not before.
         egui::ScrollArea::vertical().show(ui, |ui| {
-            self.agent_section(ui, octx);
+            self.chat_thread(ui);
+
+            ui.add_space(14.0);
+            self.log_and_settings(ui, octx);
 
             ui.add_space(18.0);
             ui.separator();
@@ -982,211 +1647,119 @@ impl Tool for SushiTool {
 }
 
 impl SushiTool {
-    fn agent_section(&mut self, ui: &mut egui::Ui, octx: &ToolCtx) {
+    /// The conversation, oldest first, chat-app style: your line right and
+    /// tinted, its line left in the panel's own card colour. Only the last
+    /// turn — and only if it's a lookup — gets live swap controls; everything
+    /// before it is a record of what was asked and found, not a second live
+    /// surface.
+    fn chat_thread(&mut self, ui: &mut egui::Ui) {
         let busy = self.rx.is_some();
-
         let t = ui.input(|i| i.time);
-        let has_ai = !self.ai_key.trim().is_empty();
 
-        // The agent gets a surface of its own. Everything else on this page is
-        // a table on the panel background; giving this block a card, a border
-        // and a running light is what makes it read as the tool rather than as
-        // one control among several.
-        let card = egui::Frame::NONE
-            .fill(BG_ELEVATED)
-            .stroke(egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.35)))
-            .corner_radius(8.0)
-            .inner_margin(egui::Margin::symmetric(18, 16));
-
-        card.show(ui, |ui| {
-            ui.horizontal(|ui| {
-                // Idle it breathes; working it runs. The panel should look
-                // awake before you have typed anything into it.
-                let phase = if busy { t * 5.0 } else { t * 1.6 };
-                let pulse = 0.5 + 0.5 * (phase.sin() as f32);
-                let (dot, _) =
-                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                let p = ui.painter();
-                // A halo that swells with the pulse, so the movement is visible
-                // at a glance rather than only on close inspection.
-                p.circle_filled(dot.center(), 4.0 + 3.5 * pulse, ACCENT.gamma_multiply(0.18));
-                p.circle_filled(dot.center(), 4.0, ACCENT.gamma_multiply(0.45 + 0.55 * pulse));
-
+        if self.chat.is_empty() && !busy {
+            ui.add_space(28.0);
+            ui.vertical_centered(|ui| {
                 ui.label(
-                    RichText::new("AI AGENT")
+                    RichText::new("FIND THE BEST SWAP")
                         .color(ACCENT)
-                        .font(FontId::proportional(17.0))
+                        .font(FontId::proportional(18.0))
                         .strong(),
                 );
+                ui.add_space(6.0);
                 ui.label(
-                    RichText::new(if busy { "working" } else { "ready" }).color(FAINT).small(),
+                    RichText::new(
+                        "Say what you want to swap, or drop a ticker to have it read the chart. \
+                         Every swap is priced through Sushi's own router first — you see the \
+                         real route and the real number before anything moves. Nothing signs or \
+                         sends on its own: you confirm every send yourself, right here.",
+                    )
+                    .color(DIM)
+                    .small(),
                 );
-
-                // Right-aligned wallet status. Whether a swap is even offered
-                // downstream (in the token card) depends entirely on this.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match (&self.wallet, self.wallet_connecting) {
-                        (Some(addr), _) => {
-                            ui.label(RichText::new(short_addr(addr)).color(UP).small());
-                            ui.label(RichText::new("●").color(UP).small());
-                        }
-                        (None, true) => {
-                            ui.add(egui::Spinner::new().size(12.0).color(FAINT));
-                            ui.label(RichText::new("connecting…").color(FAINT).small());
-                        }
-                        (None, false) => {
-                            if tool_button(ui, "Connect Frame", true) {
-                                let ctx = ui.ctx().clone();
-                                self.connect_wallet(&ctx);
-                            }
-                        }
-                    }
-                });
             });
-            ui.add_space(3.0);
-            ui.label(
-                RichText::new(
-                    "Ask it anything, or drop a ticker and let it roast the chart. It can also \
-                     swap through Sushi — you confirm every send yourself in Frame, this thing \
-                     never touches your keys.",
-                )
-                .color(DIM)
-                .small(),
-            );
-            if let Some(e) = &self.wallet_err {
-                ui.label(RichText::new(format!("✗ {e}")).color(RED).small());
-            }
-            ui.add_space(12.0);
-
-            // Ticker lookup first: it is the shortest path from "what is this
-            // thing scrolling past" to an answer, and it needs no grammar.
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("$").color(ACCENT).font(FontId::monospace(15.0)));
-                let field = ui.add_enabled(
-                    !busy,
-                    egui::TextEdit::singleline(&mut self.ticker)
-                        .hint_text("ticker — PONS, SWOGE, r0b, whatever you're aping into")
-                        .font(FontId::monospace(14.0))
-                        .desired_width(200.0),
-                );
-                let entered =
-                    field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (tool_button(ui, "Read the chart", !busy) || entered) && !busy {
-                    let ctx = ui.ctx().clone();
-                    self.look_up(&ctx);
-                }
-            });
-            ui.add_space(10.0);
-
-            ui.horizontal(|ui| {
-                let field = ui.add_enabled(
-                    has_ai && !busy,
-                    egui::TextEdit::singleline(&mut self.ask)
-                        .hint_text("or ask — how much is 1 WETH in USDG?")
-                        // Capped: the panel can be 1900px wide, and a field
-                        // stretched that far pushes Ask off to the far edge.
-                        .desired_width((ui.available_width() - 90.0).min(420.0)),
-                );
-                let entered =
-                    field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (tool_button(ui, "Ask", has_ai && !busy) || entered) && has_ai && !busy {
-                    let ctx = ui.ctx().clone();
-                    self.ask_model(&ctx);
-                }
-            });
-
-            // Starters, because the hardest part of a blank box is the first
-            // question. Clicking one asks it outright rather than only filling
-            // the field — a starter you still have to submit is placeholder
-            // text with extra steps.
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("try").color(FAINT).small());
-                for q in EXAMPLES {
-                    if tool_button(ui, q, has_ai && !busy) && has_ai && !busy {
-                        self.ask = (*q).to_string();
-                        let ctx = ui.ctx().clone();
-                        self.ask_model(&ctx);
-                    }
-                }
-            });
-        });
-
-        if !has_ai {
-            self.ai_key_setup(ui, octx);
+            ui.add_space(28.0);
+            return;
         }
-        ui.add_space(14.0);
 
-        // The conversation, oldest first. Only the last turn — and only if
-        // it's a lookup — gets live swap controls; everything before it is
-        // a record of what was asked and found, not a second live surface.
         let mut swap_action = None;
-        if self.chat.is_empty() && !busy {
-            ui.label(
-                RichText::new(
-                    "Nothing signs or sends on its own — a swap only ever starts \
-                     from a button you click, and only ever confirms in Frame.",
-                )
-                .color(FAINT)
-                .small(),
-            );
-        }
+        // Captured from the interactive turn during the loop below (borrowing
+        // `self.chat` there rules out calling a `&mut self` method inline) —
+        // the preview fetch itself runs once the loop's borrow is over.
+        let mut preview_for: Option<String> = None;
         let last_idx = self.chat.len().saturating_sub(1);
         for (i, turn) in self.chat.iter().enumerate() {
-            ui.add_space(if i == 0 { 0.0 } else { 14.0 });
-            ui.label(RichText::new(&turn.question).color(DIM).strong());
-            ui.add_space(4.0);
-            // The written line first, chat-message style — Token/Screen's own
-            // take fills this role instead, so nothing doubles up.
-            if let ChatAnswer::Result(outcome) = &turn.answer {
-                let reply = chat_reply(outcome);
-                if !reply.is_empty() {
-                    ui.label(RichText::new(reply).color(FG));
-                    ui.add_space(6.0);
-                }
-            }
+            ui.add_space(if i == 0 { 4.0 } else { 18.0 });
+            user_bubble(ui, &turn.question);
+            ui.add_space(8.0);
+
             match &turn.answer {
-                ChatAnswer::Result(Outcome::Token { info, take }) => {
-                    let interactive = i == last_idx;
-                    let step = self.swap_step.lock().unwrap().clone();
-                    let a = token_card(
-                        ui,
-                        info,
-                        take,
-                        self.wallet.as_deref(),
-                        &mut self.swap_amount,
-                        self.swap_rx.is_some(),
-                        step.label(),
-                        &self.swap_result,
-                        interactive,
-                    );
-                    if interactive {
-                        swap_action = a;
-                    }
+                ChatAnswer::Result(outcome) => {
+                    assistant_bubble(ui, |ui| {
+                        // The written line first, chat-message style —
+                        // Token/Screen/Chat's own text fills this role
+                        // instead, so nothing doubles up.
+                        let reply = chat_reply(outcome);
+                        if !reply.is_empty() {
+                            ui.label(RichText::new(reply).color(FG));
+                            ui.add_space(6.0);
+                        }
+                        let interactive = i == last_idx;
+                        let step = self.swap_step.lock().unwrap().clone();
+                        let a = render_outcome(
+                            ui,
+                            outcome,
+                            self.wallet.as_deref(),
+                            &mut self.swap_amount,
+                            self.swap_rx.is_some(),
+                            step.label(),
+                            &self.swap_result,
+                            self.preview.as_ref(),
+                            self.preview_err.as_deref().filter(|e| !e.is_empty()),
+                            self.preview_rx.is_some(),
+                            interactive,
+                            &self.holdings,
+                            &mut self.source_symbol,
+                        );
+                        if interactive {
+                            swap_action = a;
+                            if let Some(info) = as_token(outcome) {
+                                if self.wallet.is_some() && self.swap_rx.is_none() {
+                                    preview_for = Some(info.address.clone());
+                                }
+                            }
+                        }
+                    });
                 }
-                ChatAnswer::Result(outcome) => result_card(ui, outcome),
                 ChatAnswer::Error(e) => {
-                    ui.label(RichText::new(format!("✗ {e}")).color(RED));
+                    assistant_bubble(ui, |ui| {
+                        ui.label(RichText::new(format!("✗ {e}")).color(RED));
+                    });
                 }
             }
         }
         // The in-flight turn: the question already reads like part of the
         // thread, the answer is still the thinking line until it lands.
         if busy {
-            ui.add_space(if self.chat.is_empty() { 0.0 } else { 14.0 });
+            ui.add_space(if self.chat.is_empty() { 4.0 } else { 18.0 });
             if let Some(q) = &self.pending_question {
-                ui.label(RichText::new(q).color(DIM).strong());
-                ui.add_space(4.0);
+                user_bubble(ui, q);
+                ui.add_space(8.0);
             }
-            thinking_line(ui, self.busy_since, t);
+            assistant_bubble(ui, |ui| thinking_line(ui, self.busy_since, t));
         }
         if let Some(action) = swap_action {
             let ctx = ui.ctx().clone();
             self.run_swap(action.symbol, action.token_out, &ctx);
+        } else if let Some(addr) = preview_for {
+            let ctx = ui.ctx().clone();
+            self.maybe_preview_quote(&addr, &ctx);
         }
+    }
 
+    /// The recent-activity log and the optional Sushi key — settings, not
+    /// conversation, so they sit below the thread rather than inside it.
+    fn log_and_settings(&mut self, ui: &mut egui::Ui, octx: &ToolCtx) {
         if !self.log.is_empty() {
-            ui.add_space(14.0);
             ui.label(RichText::new("- recent -").color(FAINT).small());
             ui.add_space(4.0);
             for line in &self.log {
@@ -1200,9 +1773,9 @@ impl SushiTool {
                     ui.label(RichText::new(ago(line.at.elapsed().as_secs())).color(FAINT).small());
                 });
             }
+            ui.add_space(10.0);
         }
 
-        ui.add_space(14.0);
         let arrow = if self.key_open { "▾" } else { "▸" };
         if ui
             .add(
@@ -1235,6 +1808,126 @@ impl SushiTool {
                 );
             });
         }
+    }
+
+    /// Dispatches one submitted line to whichever door it actually is —
+    /// short, single-word, no-space text is treated as a bare ticker (the
+    /// fast path: no model call, works with no AI key at all); anything
+    /// longer or with a space goes to the model to parse. One box, same two
+    /// doors as before.
+    fn submit(&mut self, ctx: &egui::Context) {
+        let text = self.ask.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        if looks_like_ticker(&text) {
+            self.ask.clear();
+            self.ticker = text.trim_start_matches('$').to_string();
+            self.look_up(ctx);
+        } else {
+            self.ask_model(ctx);
+        }
+    }
+
+    /// The input, pinned to the bottom of the panel — one box, a send
+    /// button, and the wallet/status readout that decides what the box can
+    /// even do right now.
+    fn composer(&mut self, ui: &mut egui::Ui, octx: &ToolCtx) {
+        let busy = self.rx.is_some();
+        let has_ai = !self.ai_key.trim().is_empty();
+        let t = ui.input(|i| i.time);
+
+        if !has_ai {
+            self.ai_key_setup(ui, octx);
+            ui.add_space(8.0);
+        }
+
+        // Starters, because the hardest part of a blank box is the first
+        // question — shown only before the first turn, same as a fresh
+        // ChatGPT/Claude conversation. Clicking one asks it outright rather
+        // than only filling the field.
+        if self.chat.is_empty() && !busy {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("try").color(FAINT).small());
+                for q in EXAMPLES {
+                    if tool_button(ui, q, has_ai && !busy) && has_ai && !busy {
+                        self.ask = (*q).to_string();
+                        let ctx = ui.ctx().clone();
+                        self.ask_model(&ctx);
+                    }
+                }
+            });
+            ui.add_space(8.0);
+        }
+
+        ui.horizontal(|ui| {
+            // Idle it breathes; working it runs. The panel should look awake
+            // before you have typed anything into it.
+            let phase = if busy { t * 5.0 } else { t * 1.6 };
+            let pulse = 0.5 + 0.5 * (phase.sin() as f32);
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            let p = ui.painter();
+            p.circle_filled(dot.center(), 3.0 + 2.5 * pulse, ACCENT.gamma_multiply(0.18));
+            p.circle_filled(dot.center(), 3.0, ACCENT.gamma_multiply(0.45 + 0.55 * pulse));
+            ui.label(RichText::new(if busy { "working" } else { "ready" }).color(FAINT).small());
+
+            // Right-aligned wallet status. Whether a swap is even offered
+            // downstream (in the token card) depends entirely on this.
+            let wallet_snapshot = self.wallet.clone();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                match &wallet_snapshot {
+                    Some(addr) => {
+                        if tool_button(ui, "forget", true) {
+                            signer::clear_key(octx.config_dir);
+                            self.wallet = None;
+                        }
+                        ui.label(RichText::new(short_addr(addr)).color(UP).small());
+                        ui.label(RichText::new("●").color(UP).small());
+                    }
+                    None => {
+                        if tool_button(ui, "Import wallet", true) {
+                            self.wallet_key_open = !self.wallet_key_open;
+                        }
+                    }
+                }
+            });
+        });
+        if let Some(e) = &self.wallet_err {
+            ui.label(RichText::new(format!("✗ {e}")).color(RED).small());
+        }
+        if self.wallet.is_none() && self.wallet_key_open {
+            self.local_key_import(ui, octx);
+        }
+        ui.add_space(6.0);
+
+        let frame = egui::Frame::NONE
+            .fill(BG_ELEVATED)
+            .stroke(egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.35)))
+            .corner_radius(22.0)
+            .inner_margin(egui::Margin::symmetric(16, 10));
+        frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let field = ui.add_enabled(
+                    !busy,
+                    egui::TextEdit::singleline(&mut self.ask)
+                        .hint_text(
+                            "swap into a ticker, or ask anything — \"1 WETH in USDG?\", \
+                             \"PONS\", \"what's pumping\"",
+                        )
+                        .frame(egui::Frame::NONE)
+                        .font(FontId::proportional(14.0))
+                        .desired_width((ui.available_width() - 66.0).max(80.0)),
+                );
+                let entered =
+                    field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let text = self.ask.trim().to_string();
+                let ready = !text.is_empty() && !busy && (looks_like_ticker(&text) || has_ai);
+                if (tool_button(ui, "Send", ready) || entered) && ready {
+                    let ctx = ui.ctx().clone();
+                    self.submit(&ctx);
+                }
+            });
+        });
     }
 }
 
@@ -1286,6 +1979,47 @@ impl SushiTool {
                     .color(FAINT)
                     .small(),
                 );
+            });
+    }
+
+    /// Import path for the local-signer backend. The key is validated,
+    /// encrypted at rest (`signer::set_key`), and never kept in this field —
+    /// only the derived address (public, harmless to hold in memory) does.
+    fn local_key_import(&mut self, ui: &mut egui::Ui, octx: &ToolCtx) {
+        egui::Frame::default()
+            .fill(BG_ELEVATED)
+            .corner_radius(10.0)
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Encrypted at rest on this machine. You'll confirm the amount, address \
+                         and gas yourself before anything is signed.",
+                    )
+                    .color(FAINT)
+                    .small(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.wallet_key_input)
+                            .password(true)
+                            .hint_text("private key (hex)")
+                            .desired_width(280.0),
+                    );
+                    let ready = !self.wallet_key_input.trim().is_empty();
+                    if tool_button(ui, "Import", ready) && ready {
+                        match signer::set_key(octx.config_dir, &self.wallet_key_input) {
+                            Ok(addr) => {
+                                self.wallet = Some(addr);
+                                self.wallet_err = None;
+                                self.wallet_key_open = false;
+                            }
+                            Err(e) => self.wallet_err = Some(e),
+                        }
+                        self.wallet_key_input.clear();
+                    }
+                });
             });
     }
 }
@@ -1593,6 +2327,57 @@ fn short_addr(a: &str) -> String {
     if a.len() < 12 { a.to_string() } else { format!("{}…{}", &a[..6], &a[a.len() - 4..]) }
 }
 
+/// A label/value line in the confirmation modal — label dim and fixed-width,
+/// value in the normal foreground colour, right where the eye expects a
+/// number after reading "Amount".
+fn row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(DIM).small());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(value).color(FG));
+        });
+    });
+}
+
+/// Short, single-word, no-space text reads as a bare ticker rather than a
+/// sentence — the fast path that skips the model entirely (and works with no
+/// AI key at all), same shape a `$PONS` or a trending-row click already used.
+fn looks_like_ticker(text: &str) -> bool {
+    let t = text.trim().trim_start_matches('$');
+    !t.is_empty() && t.len() <= 15 && !t.contains(' ') && t.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// One user line, right-aligned like every chat app ever — the one bit of
+/// "chat UI" convention this needed to actually read as a conversation
+/// instead of a form with a memory.
+fn user_bubble(ui: &mut egui::Ui, text: &str) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+        let max_w = (ui.available_width() * 0.72).min(560.0);
+        egui::Frame::NONE
+            .fill(ACCENT.gamma_multiply(0.22))
+            .corner_radius(14.0)
+            .inner_margin(egui::Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_max_width(max_w);
+                ui.label(RichText::new(text).color(FG));
+            });
+    });
+}
+
+/// The agent's half of the exchange — same rounded-bubble treatment, left
+/// side, wide enough to hold a data card without cramping it.
+fn assistant_bubble(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let max_w = (ui.available_width() * 0.86).min(720.0);
+    egui::Frame::NONE
+        .fill(BG_ELEVATED)
+        .corner_radius(14.0)
+        .inner_margin(egui::Margin::symmetric(16, 14))
+        .show(ui, |ui| {
+            ui.set_max_width(max_w);
+            add_contents(ui);
+        });
+}
+
 /// One token, read across every window the indexer gives.
 ///
 /// The four percentages sit side by side on purpose: a token up on the day and
@@ -1601,12 +2386,16 @@ fn short_addr(a: &str) -> String {
 /// A chat-requested read of the board: the same table the always-visible
 /// section shows, plus a take on the set as a whole. Rows are display-only
 /// here — the persistent board below is where a row turns into a lookup.
-fn screen_card(ui: &mut egui::Ui, rows: &[trending::Row], take: &str) {
+fn screen_card(ui: &mut egui::Ui, rows: &[trending::Row], take: &str, window: trending::Window) {
     ui.label(
-        RichText::new(format!("ROBINHOOD CHAIN · {} tokens · by 24h volume", rows.len()))
-            .color(ACCENT)
-            .small()
-            .strong(),
+        RichText::new(format!(
+            "ROBINHOOD CHAIN · {} tokens · by {} volume",
+            rows.len(),
+            window.label()
+        ))
+        .color(ACCENT)
+        .small()
+        .strong(),
     );
     ui.add_space(8.0);
 
@@ -1652,6 +2441,80 @@ struct SwapAction {
 /// latest in the chat thread, so an old lookup reads as history rather than
 /// as a second live control surface for the one wallet session.
 #[allow(clippy::too_many_arguments)]
+/// The `Token` at the bottom of a possibly-nested `Chat.card` — peels
+/// through however many `Chat` layers there are (there's only ever at most
+/// one in practice) to find the swap-eligible token underneath, or `None`
+/// if this turn's card wasn't a token lookup at all.
+fn as_token(outcome: &Outcome) -> Option<&trending::Info> {
+    match outcome {
+        Outcome::Token { info, .. } => Some(info),
+        Outcome::Chat { card: Some(inner), .. } => as_token(inner),
+        _ => None,
+    }
+}
+
+/// Renders whatever card belongs under this turn's written line — a `Token`
+/// gets the full interactive swap card (needs the wallet/swap state this
+/// takes as plain parameters rather than `&mut self`, so the caller can
+/// still hold `self.chat.iter()` borrowed while calling this), a `Chat`
+/// unwraps to whatever it's carrying, and everything else goes through the
+/// generic, non-interactive `result_card_inner`.
+#[allow(clippy::too_many_arguments)]
+fn render_outcome(
+    ui: &mut egui::Ui,
+    outcome: &Outcome,
+    wallet: Option<&str>,
+    swap_amount: &mut String,
+    swap_busy: bool,
+    swap_step: &str,
+    swap_result: &Option<Result<SwapDone, String>>,
+    preview: Option<&api::Quote>,
+    preview_err: Option<&str>,
+    preview_loading: bool,
+    interactive: bool,
+    holdings: &[Holding],
+    source_symbol: &mut String,
+) -> Option<SwapAction> {
+    match outcome {
+        Outcome::Token { info, take } => token_card(
+            ui,
+            info,
+            take,
+            wallet,
+            swap_amount,
+            swap_busy,
+            swap_step,
+            swap_result,
+            preview,
+            preview_err,
+            preview_loading,
+            interactive,
+            holdings,
+            source_symbol,
+        ),
+        Outcome::Chat { card: Some(inner), .. } => render_outcome(
+            ui,
+            inner,
+            wallet,
+            swap_amount,
+            swap_busy,
+            swap_step,
+            swap_result,
+            preview,
+            preview_err,
+            preview_loading,
+            interactive,
+            holdings,
+            source_symbol,
+        ),
+        Outcome::Chat { card: None, .. } => None,
+        other => {
+            result_card_inner(ui, other);
+            None
+        }
+    }
+}
+
 fn token_card(
     ui: &mut egui::Ui,
     info: &trending::Info,
@@ -1661,7 +2524,12 @@ fn token_card(
     swap_busy: bool,
     swap_step: &str,
     swap_result: &Option<Result<SwapDone, String>>,
+    preview: Option<&api::Quote>,
+    preview_err: Option<&str>,
+    preview_loading: bool,
     interactive: bool,
+    holdings: &[Holding],
+    source_symbol: &mut String,
 ) -> Option<SwapAction> {
     ui.horizontal(|ui| {
         ui.label(
@@ -1802,7 +2670,27 @@ fn token_card(
                         .desired_width(70.0)
                         .font(FontId::monospace(13.0)),
                 );
-                ui.label(RichText::new("WETH →").color(DIM));
+                // The candidate list is only ever what the wallet actually
+                // holds among the curated tokens (`scan_wallet_holdings`) —
+                // WETH stays selectable even at a zero balance since it's
+                // the one token every pool here is guaranteed to pair
+                // against, and picking it costs nothing to try.
+                egui::ComboBox::from_id_salt(("swap_source", &info.address))
+                    .selected_text(RichText::new(source_symbol.as_str()).color(DIM))
+                    .show_ui(ui, |ui| {
+                        if holdings.is_empty() {
+                            ui.selectable_value(source_symbol, "WETH".to_string(), "WETH");
+                        }
+                        for h in holdings {
+                            let label = format!(
+                                "{} ({})",
+                                h.symbol,
+                                market::token_amount(&tokens::format_units(h.balance_raw, h.decimals))
+                            );
+                            ui.selectable_value(source_symbol, h.symbol.to_string(), label);
+                        }
+                    });
+                ui.label(RichText::new("→").color(DIM));
                 ui.label(RichText::new(&info.symbol).color(FG).strong());
                 if tool_button(ui, "Swap", true) {
                     action = Some(SwapAction {
@@ -1811,10 +2699,67 @@ fn token_card(
                     });
                 }
             });
+            ui.add_space(6.0);
+            // The whole point of asking Sushi before signing anything: this
+            // is its router's actual best route, quoted live, not a promise.
+            // Degen voice on purpose — it's the same board as the take above
+            // it — but the numbers are real, re-fetched on every settled
+            // amount rather than phrased by a model.
+            if preview_loading {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(11.0).color(FAINT));
+                    ui.label(RichText::new("sniffing out the best route…").color(FAINT).small());
+                });
+            } else if let Some(q) = preview {
+                let (_, got) = Outcome::legs(q);
+                let impact = q.price_impact.unwrap_or(0.0);
+                let hot = impact.abs() > 0.03;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "≈ {} {} in the bag",
+                            market::token_amount(&got),
+                            q.token_out.symbol
+                        ))
+                        .color(if hot { ORANGE } else { UP })
+                        .font(FontId::monospace(12.5)),
+                    );
+                    if q.price_impact.is_some() {
+                        ui.label(
+                            RichText::new(format!("impact {:.2}%", impact * 100.0))
+                                .color(if hot { RED } else { FAINT })
+                                .small(),
+                        );
+                    }
+                });
+                // The number above is the router's own output amount, not a
+                // separate price call — this is that same amount times the
+                // token's already-fetched spot price, so it can't drift from
+                // what the swap actually quotes.
+                if info.price_usd > 0.0 {
+                    if let Ok(units) = got.parse::<f64>() {
+                        ui.label(
+                            RichText::new(format!("≈ {}", market::money_compact(units * info.price_usd)))
+                                .color(FAINT)
+                                .small(),
+                        );
+                    }
+                }
+                if hot {
+                    ui.label(
+                        RichText::new("thin pool — that's a real haircut, maybe size down")
+                            .color(RED)
+                            .small(),
+                    );
+                }
+            } else if let Some(e) = preview_err {
+                ui.label(RichText::new(format!("no route — {e}")).color(FAINT).small());
+            }
             ui.add_space(4.0);
             ui.label(
                 RichText::new(
-                    "Opens in Frame for you to review and confirm — nothing is sent from here.",
+                    "You'll be asked to review and confirm the exact amount, address and gas \
+                     before anything is signed.",
                 )
                 .color(FAINT)
                 .small(),
@@ -1826,11 +2771,23 @@ fn token_card(
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(format!(
-                        "✓ swapped {} WETH for ~{} {}",
-                        done.sent, done.expected_out, done.got_symbol
+                        "✓ swapped {} {} for ~{} {}",
+                        market::token_amount(&done.sent),
+                        done.sent_symbol,
+                        market::token_amount(&done.expected_out),
+                        done.got_symbol
                     ))
                     .color(UP),
                 );
+                if info.price_usd > 0.0 {
+                    if let Ok(units) = done.expected_out.parse::<f64>() {
+                        ui.label(
+                            RichText::new(format!("≈ {}", market::money_compact(units * info.price_usd)))
+                                .color(FAINT)
+                                .small(),
+                        );
+                    }
+                }
                 if let Some(pct) = done.price_impact {
                     ui.label(
                         RichText::new(format!("price impact {:.2}%", pct * 100.0))
@@ -1856,100 +2813,102 @@ fn token_card(
     } else {
         ui.add_space(10.0);
         ui.label(
-            RichText::new("Connect Frame above to swap into this token.").color(FAINT).small(),
+            RichText::new("Connect a wallet above to swap into this token.").color(FAINT).small(),
         );
     }
 
     action
 }
 
-fn result_card(ui: &mut egui::Ui, outcome: &Outcome) {
-    egui::Frame::default()
-        .fill(BG_ELEVATED)
-        .corner_radius(12.0)
-        .inner_margin(egui::Margin::same(14))
-        .show(ui, |ui| match outcome {
-            // Token is rendered by `agent_section` directly (it needs the
-            // wallet and swap state this function isn't given) — rendering
-            // nothing here keeps that invariant instead of panicking on it.
-            Outcome::Token { .. } => {}
-            Outcome::Market { rows, sort, limit } => {
-                ui.label(
-                    RichText::new(format!("top {limit} · {}", sort.label()))
-                        .color(FAINT)
-                        .small(),
-                );
-                ui.add_space(6.0);
-                table_header(ui);
-                for (i, row) in rows.iter().enumerate() {
-                    market_row(ui, i, row);
-                }
+/// Content only, no frame of its own — the caller (`assistant_bubble`)
+/// already supplies the card, so this would otherwise double up.
+fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
+    match outcome {
+        // Token is rendered by `chat_thread` directly (it needs the wallet
+        // and swap state this function isn't given) — rendering nothing here
+        // keeps that invariant instead of panicking on it.
+        Outcome::Token { .. } => {}
+        // `chat_thread` reaches for `render_outcome` before this function
+        // ever sees a `Chat` — this arm only exists for exhaustiveness, and
+        // does the best it can (no wallet/swap state here) if it's ever hit
+        // some other way.
+        Outcome::Chat { card: Some(inner), .. } => result_card_inner(ui, inner),
+        Outcome::Chat { card: None, .. } => {}
+        Outcome::Market { rows, sort, limit } => {
+            ui.label(
+                RichText::new(format!("top {limit} · {}", sort.label())).color(FAINT).small(),
+            );
+            ui.add_space(6.0);
+            table_header(ui);
+            for (i, row) in rows.iter().enumerate() {
+                market_row(ui, i, row);
             }
-            Outcome::Screen { rows, take } => screen_card(ui, rows, take),
-            Outcome::Price { chain, symbol, address, usd } => {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(symbol).color(FG).strong());
-                    ui.label(RichText::new(*chain).color(DIM).small());
-                });
-                ui.label(
-                    RichText::new(market::money_price(*usd))
-                        .color(ACCENT)
-                        .font(FontId::monospace(20.0)),
-                );
-                ui.label(RichText::new(address).color(FAINT).font(FontId::monospace(11.0)));
+        }
+        Outcome::Screen { rows, take, window } => screen_card(ui, rows, take, *window),
+        Outcome::Price { chain, symbol, address, usd } => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(symbol).color(FG).strong());
+                ui.label(RichText::new(*chain).color(DIM).small());
+            });
+            ui.label(
+                RichText::new(market::money_price(*usd))
+                    .color(ACCENT)
+                    .font(FontId::monospace(20.0)),
+            );
+            ui.label(RichText::new(address).color(FAINT).font(FontId::monospace(11.0)));
+        }
+        Outcome::Quote { chain, quote } => {
+            let (sent, got) = Outcome::legs(quote);
+            ui.horizontal(|ui| {
+                let (label, color) = match quote.status.as_str() {
+                    "Success" => ("Success", UP),
+                    "Partial" => ("Partial route", ORANGE),
+                    other => (other, DIM),
+                };
+                ui.label(RichText::new(label).color(color).strong());
+                ui.label(RichText::new(*chain).color(DIM).small());
+            });
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!(
+                    "{sent} {}  →  {got} {}",
+                    quote.token_in.symbol, quote.token_out.symbol
+                ))
+                .color(FG)
+                .font(FontId::monospace(16.0)),
+            );
+            ui.add_space(6.0);
+            if let Some(pi) = quote.price_impact {
+                // Fraction, not percent: 0.005 is 0.5%.
+                let pct = pi * 100.0;
+                let color = if pct.abs() >= 1.0 { RED } else { DIM };
+                ui.label(RichText::new(format!("price impact {pct:.3}%")).color(color).small());
             }
-            Outcome::Quote { chain, quote } => {
-                let (sent, got) = Outcome::legs(quote);
-                ui.horizontal(|ui| {
-                    let (label, color) = match quote.status.as_str() {
-                        "Success" => ("Success", UP),
-                        "Partial" => ("Partial route", ORANGE),
-                        other => (other, DIM),
-                    };
-                    ui.label(RichText::new(label).color(color).strong());
-                    ui.label(RichText::new(*chain).color(DIM).small());
-                });
-                ui.add_space(6.0);
+            if let Some(p) = quote.unit_price() {
                 ui.label(
                     RichText::new(format!(
-                        "{sent} {}  →  {got} {}",
-                        quote.token_in.symbol, quote.token_out.symbol
+                        "1 {} ≈ {} {}",
+                        quote.token_in.symbol,
+                        fmt_price(p),
+                        quote.token_out.symbol
                     ))
-                    .color(FG)
-                    .font(FontId::monospace(16.0)),
-                );
-                ui.add_space(6.0);
-                if let Some(pi) = quote.price_impact {
-                    // Fraction, not percent: 0.005 is 0.5%.
-                    let pct = pi * 100.0;
-                    let color = if pct.abs() >= 1.0 { RED } else { DIM };
-                    ui.label(RichText::new(format!("price impact {pct:.3}%")).color(color).small());
-                }
-                if let Some(p) = quote.unit_price() {
-                    ui.label(
-                        RichText::new(format!(
-                            "1 {} ≈ {} {}",
-                            quote.token_in.symbol,
-                            fmt_price(p),
-                            quote.token_out.symbol
-                        ))
-                        .color(DIM)
-                        .small(),
-                    );
-                }
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(format!("in  {}", quote.token_in.address))
-                        .color(FAINT)
-                        .font(FontId::monospace(11.0)),
-                );
-                ui.label(
-                    RichText::new(format!("out {}", quote.token_out.address))
-                        .color(FAINT)
-                        .font(FontId::monospace(11.0)),
+                    .color(DIM)
+                    .small(),
                 );
             }
-        });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("in  {}", quote.token_in.address))
+                    .color(FAINT)
+                    .font(FontId::monospace(11.0)),
+            );
+            ui.label(
+                RichText::new(format!("out {}", quote.token_out.address))
+                    .color(FAINT)
+                    .font(FontId::monospace(11.0)),
+            );
+        }
+    }
 }
 
 /// Prices span many orders of magnitude (ETH/USDC vs SUSHI/ETH), so pick the
