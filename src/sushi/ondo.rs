@@ -69,6 +69,15 @@ fn get_proxy_all() -> Result<Value, String> {
     read_response(resp)
 }
 
+/// The proxy's `/dividends/:symbol` route (upstream `GET
+/// /v1/assets/{symbol}/dividends`) — cached for an hour on the proxy side
+/// since this changes at most quarterly, nowhere near as often as a price.
+fn get_proxy_dividends(symbol: &str) -> Result<Value, String> {
+    let url = format!("{PROXY_BASE}/dividends/{symbol}");
+    let resp = agent().get(&url).call();
+    read_response(resp)
+}
+
 fn read_response(resp: Result<ureq::Response, ureq::Error>) -> Result<Value, String> {
     match resp {
         Ok(r) => r.into_json().map_err(|e| format!("bad response: {e}")),
@@ -141,6 +150,45 @@ impl Market {
             _ => None,
         }
     }
+}
+
+/// One symbol's dividend info — a separate endpoint from `market`, since
+/// unlike price this changes at most quarterly. Ondo's tokens don't pay
+/// this out in cash to holders: it's the underlying stock's real dividend,
+/// which on-chain shows up as the token's `sharesMultiplier` ratcheting up
+/// instead (see the module doc comment) — this data explains *why* the
+/// price drifts, it isn't itself something a holder receives here.
+#[derive(Debug)]
+pub struct Dividend {
+    pub ticker: String,
+    /// Annualized yield as a fraction (0.0245 = 2.45%), not a percentage —
+    /// multiply by 100 for display, same convention as everything else this
+    /// module hands back as a plain decimal.
+    pub yield_frac: Option<f64>,
+    pub payout_frequency: Option<String>,
+    pub last_cash_amount: Option<f64>,
+    pub last_payment_date: Option<String>,
+}
+
+pub fn dividends(ticker: &str, api_key: &str) -> Result<Dividend, String> {
+    let symbol = normalize_symbol(ticker);
+    let v = if api_key.trim().is_empty() {
+        get_proxy_dividends(&symbol)?
+    } else {
+        get(&format!("/assets/{symbol}/dividends"), api_key)?
+    };
+    parse_dividend(&v)
+}
+
+fn parse_dividend(v: &Value) -> Result<Dividend, String> {
+    let ticker = v["ticker"].as_str().unwrap_or_default().to_uppercase();
+    Ok(Dividend {
+        ticker,
+        yield_frac: num(&v["dividendYield"]),
+        payout_frequency: v["payoutFrequency"].as_str().map(str::to_string),
+        last_cash_amount: num(&v["lastCashAmount"]),
+        last_payment_date: v["lastPaymentDate"].as_str().map(str::to_string),
+    })
 }
 
 /// Normalizes a bare ticker (`TSLA`) to Ondo's symbol convention — minimum 3
@@ -300,6 +348,39 @@ mod tests {
     fn leaves_an_already_correct_symbol_alone() {
         assert_eq!(normalize_symbol("TSLAon"), "TSLAon");
         assert_eq!(normalize_symbol("AAPLon"), "AAPLon");
+    }
+
+    #[test]
+    fn parse_dividend_reads_the_real_ondo_shape() {
+        let v: Value = serde_json::from_str(
+            r#"{
+                "ticker": "AAPL",
+                "dividendYield": "0.0245",
+                "payoutFrequency": "quarterly",
+                "lastCashAmount": "1.54",
+                "lastPaymentDate": "2025-02-15",
+                "timestamp": 1746655938000
+            }"#,
+        )
+        .unwrap();
+        let d = parse_dividend(&v).unwrap();
+        assert_eq!(d.ticker, "AAPL");
+        assert!((d.yield_frac.unwrap() - 0.0245).abs() < 1e-9);
+        assert_eq!(d.payout_frequency.as_deref(), Some("quarterly"));
+        assert!((d.last_cash_amount.unwrap() - 1.54).abs() < 1e-9);
+        assert_eq!(d.last_payment_date.as_deref(), Some("2025-02-15"));
+    }
+
+    #[test]
+    fn parse_dividend_tolerates_a_non_paying_stock() {
+        let v: Value = serde_json::from_str(
+            r#"{"ticker": "META", "payoutFrequency": "none"}"#,
+        )
+        .unwrap();
+        let d = parse_dividend(&v).unwrap();
+        assert_eq!(d.ticker, "META");
+        assert!(d.yield_frac.is_none());
+        assert_eq!(d.payout_frequency.as_deref(), Some("none"));
     }
 
     /// `get` (the bring-your-own-key path) must still short-circuit before

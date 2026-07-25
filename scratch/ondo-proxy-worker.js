@@ -5,19 +5,25 @@
 // in any chat/tool history.
 //
 // Routes:
-//   GET /market/:symbol  one symbol (already normalized, e.g. TSLAon),
-//                        cached at the edge per-symbol for 30s.
-//   GET /market-all      every supported asset in one call
-//                        (upstream: GET /v1/assets/all/market), cached at
-//                        the edge for 20s — this is the bulk pull
-//                        ondo_screen uses to cover the whole watchlist
-//                        instead of one request per symbol.
-// Both routes collapse concurrent Hyperium users into one upstream call per
+//   GET /market/:symbol     one symbol's market data (already normalized,
+//                           e.g. TSLAon), cached at the edge per-symbol for
+//                           30s.
+//   GET /market-all         every supported asset in one call
+//                           (upstream: GET /v1/assets/all/market), cached at
+//                           the edge for 20s — this is the bulk pull
+//                           ondo_screen uses to cover the whole watchlist
+//                           instead of one request per symbol.
+//   GET /dividends/:symbol  one symbol's dividend info (yield, payout
+//                           frequency, last cash amount/date), cached for
+//                           1 hour — this data changes at most quarterly,
+//                           nowhere near as often as a price.
+// All routes collapse concurrent Hyperium users into one upstream call per
 // cache window, so this stays cheap against Ondo's own rate limits.
 
 const ONDO_BASE = "https://api.gm.ondo.finance/v1";
 const CACHE_SECONDS = 30;
 const ALL_CACHE_SECONDS = 20;
+const DIVIDEND_CACHE_SECONDS = 3600;
 const SYMBOL_RE = /^[A-Za-z0-9]{1,15}$/;
 
 export default {
@@ -32,15 +38,25 @@ export default {
       return proxy(url, request, ctx, env, "/assets/all/market", ALL_CACHE_SECONDS);
     }
 
-    const match = url.pathname.match(/^\/market\/([^/]+)$/);
-    if (!match) {
-      return json({ error: "not found" }, 404);
+    const marketMatch = url.pathname.match(/^\/market\/([^/]+)$/);
+    if (marketMatch) {
+      const symbol = marketMatch[1];
+      if (!SYMBOL_RE.test(symbol)) {
+        return json({ error: "invalid symbol" }, 400);
+      }
+      return proxy(url, request, ctx, env, `/assets/${symbol}/market`, CACHE_SECONDS);
     }
-    const symbol = match[1];
-    if (!SYMBOL_RE.test(symbol)) {
-      return json({ error: "invalid symbol" }, 400);
+
+    const dividendMatch = url.pathname.match(/^\/dividends\/([^/]+)$/);
+    if (dividendMatch) {
+      const symbol = dividendMatch[1];
+      if (!SYMBOL_RE.test(symbol)) {
+        return json({ error: "invalid symbol" }, 400);
+      }
+      return proxy(url, request, ctx, env, `/assets/${symbol}/dividends`, DIVIDEND_CACHE_SECONDS);
     }
-    return proxy(url, request, ctx, env, `/assets/${symbol}/market`, CACHE_SECONDS);
+
+    return json({ error: "not found" }, 404);
   },
 };
 

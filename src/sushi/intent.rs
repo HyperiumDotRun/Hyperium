@@ -66,6 +66,12 @@ pub enum Intent {
     StockLookup {
         ticker: String,
     },
+    /// One Ondo Stocks ticker's dividend info (yield, payout frequency, last
+    /// cash amount/date) — a separate Ondo endpoint from `StockLookup`'s
+    /// market data, so its own intent rather than folded into that one.
+    DividendLookup {
+        ticker: String,
+    },
 }
 
 /// Reads `input["chain"]` (defaulting to Ethereum) against the curated

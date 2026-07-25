@@ -161,7 +161,9 @@ wallet_balance (the imported wallet's real on-chain balance of one token, read l
 is the ONLY way you ever know what's in the wallet), execute_swap (actually sends a swap on \
 Robinhood Chain from the imported wallet — see the paragraph below on when to call it), \
 lookup_stock (reference price for one named Ondo Finance tokenized US stock — TSLA/TSLAon, \
-AAPL/AAPLon, etc), ondo_screen (scans EVERY Ondo Stocks asset at once, ranked by unusualness \
+AAPL/AAPLon, etc), lookup_dividend (that same stock's dividend info — yield, payout \
+frequency, last payment — a separate call, use it only when dividends/yield are actually \
+asked about), ondo_screen (scans EVERY Ondo Stocks asset at once, ranked by unusualness \
 — see the paragraph below). Prefer screen_chain over market_overview when Robinhood Chain is \
 what's actually meant, since it has finer windows market_overview structurally can't. Prefer \
 lookup_token over get_price/get_quote for anything not in that whitelist above — that's the \
@@ -328,6 +330,17 @@ enum Outcome {
     /// "what's heating up right now", a different question from `Screen`'s
     /// "what's busiest today" even though both draw on the same board.
     ChainHeat { rows: Vec<trending::Row> },
+    /// One Ondo Stock's dividend info — a separate Ondo endpoint from
+    /// `Stock`'s market data, explaining *why* the price drifts (dividends
+    /// reinvest into the token rather than paying out) rather than what the
+    /// price is doing right now.
+    Dividend {
+        ticker: String,
+        yield_frac: Option<f64>,
+        payout_frequency: Option<String>,
+        last_cash_amount: Option<f64>,
+        last_payment_date: Option<String>,
+    },
 }
 
 /// What a completed swap actually did, re-read from the chain side rather
@@ -461,6 +474,18 @@ fn chat_reply(outcome: &Outcome) -> String {
             ),
             None => "Nothing on Robinhood Chain has a usable volume reading right now.".to_string(),
         },
+        Outcome::Dividend { ticker, yield_frac, payout_frequency, last_cash_amount, .. } => {
+            match (yield_frac, payout_frequency.as_deref()) {
+                (Some(y), Some(freq)) => format!(
+                    "{ticker} yields about {:.2}% ({freq}){}.",
+                    y * 100.0,
+                    last_cash_amount
+                        .map(|c| format!(", last paid ${c:.2}/share"))
+                        .unwrap_or_default(),
+                ),
+                _ => format!("{ticker} doesn't have dividend data on file right now."),
+            }
+        }
     }
 }
 
@@ -802,6 +827,16 @@ fn run(intent: Intent, api_key: &str, ai_key: &str, ondo_key: &str) -> Result<Ou
                 take,
             })
         }
+        Intent::DividendLookup { ticker } => {
+            let d = ondo::dividends(&ticker, ondo_key)?;
+            Ok(Outcome::Dividend {
+                ticker: d.ticker,
+                yield_frac: d.yield_frac,
+                payout_frequency: d.payout_frequency,
+                last_cash_amount: d.last_cash_amount,
+                last_payment_date: d.last_payment_date,
+            })
+        }
     }
 }
 
@@ -927,6 +962,21 @@ fn agent_tools() -> Vec<crate::llm::ToolSpec> {
                 click here for these — just say the numbers if asked. Only call this for \
                 stock/equity tickers explicitly framed as Ondo/tokenized-stock questions, not \
                 for anything on Robinhood Chain (use lookup_token for that).",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "ticker": { "type": "string", "description": "e.g. \"TSLA\" or \"TSLAon\"" } },
+                "required": ["ticker"]
+            }),
+        },
+        crate::llm::ToolSpec {
+            name: "lookup_dividend",
+            description: "Dividend info for one named Ondo Finance tokenized stock: \
+                annualized yield, how often it pays (monthly/quarterly/etc, or none), and the \
+                last cash amount/date. A separate call from lookup_stock — that one is price, \
+                this one is dividends, and most questions only need one of the two. Important: \
+                Ondo doesn't pay this out in cash to a holder here — it compounds into the \
+                token's own price instead (the \"shares multiplier\" mentioned elsewhere), so \
+                mention that if someone sounds like they're expecting a cash payment.",
             input_schema: json!({
                 "type": "object",
                 "properties": { "ticker": { "type": "string", "description": "e.g. \"TSLA\" or \"TSLAon\"" } },
@@ -1090,6 +1140,20 @@ fn tool_result_text(outcome: &Outcome) -> String {
                 ));
             }
             out
+        }
+        Outcome::Dividend { ticker, yield_frac, payout_frequency, last_cash_amount, last_payment_date } => {
+            match (yield_frac, payout_frequency.as_deref()) {
+                (Some(y), Some(freq)) => format!(
+                    "{ticker} dividend: {:.2}% annualized yield, paid {freq}. Last payment: {}{}.",
+                    y * 100.0,
+                    last_cash_amount.map(|c| format!("${c:.2}/share")).unwrap_or_else(|| "unknown amount".into()),
+                    last_payment_date.as_deref().map(|d| format!(" on {d}")).unwrap_or_default(),
+                ),
+                _ => format!(
+                    "{ticker}: no dividend data on file (either it doesn't pay one, or Ondo \
+                     hasn't recorded one for it)."
+                ),
+            }
         }
     }
 }
@@ -1319,6 +1383,14 @@ fn dispatch_tool(
                 Err("no ticker given".to_string())
             } else {
                 run(Intent::StockLookup { ticker }, "", "", ondo_key)
+            }
+        }
+        "lookup_dividend" => {
+            let ticker = input["ticker"].as_str().unwrap_or_default().trim().to_string();
+            if ticker.is_empty() {
+                Err("no ticker given".to_string())
+            } else {
+                run(Intent::DividendLookup { ticker }, "", "", ondo_key)
             }
         }
         "ondo_screen" => {
@@ -1857,6 +1929,7 @@ impl SushiTool {
             Ok(Outcome::ChainHeat { rows }) => {
                 (format!("screened {} Robinhood Chain tokens by heat", rows.len()), true)
             }
+            Ok(Outcome::Dividend { ticker, .. }) => (format!("read {ticker}'s dividend info"), true),
             Ok(Outcome::Chat { card, .. }) => (
                 match card.as_deref() {
                     Some(Outcome::Token { info, .. }) => format!("chatted, read {}", info.symbol),
@@ -3939,6 +4012,49 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                         );
                     }
                 });
+            }
+        }
+        Outcome::Dividend { ticker, yield_frac, payout_frequency, last_cash_amount, last_payment_date } => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(ticker).color(FG).strong());
+                ui.label(RichText::new("Dividend · Ondo Finance").color(DIM).small());
+            });
+            ui.add_space(4.0);
+            match (yield_frac, payout_frequency.as_deref()) {
+                (Some(y), Some(freq)) if freq != "none" => {
+                    ui.label(
+                        RichText::new(format!("{:.2}% annualized yield", y * 100.0))
+                            .color(ACCENT)
+                            .font(FontId::monospace(18.0)),
+                    );
+                    ui.label(RichText::new(format!("paid {freq}")).color(DIM).small());
+                    if let Some(c) = last_cash_amount {
+                        let when = last_payment_date
+                            .as_deref()
+                            .map(|d| format!(" on {d}"))
+                            .unwrap_or_default();
+                        ui.label(
+                            RichText::new(format!("last payment: ${c:.2}/share{when}"))
+                                .color(FAINT)
+                                .small(),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Not paid out here — it compounds into the token's price instead \
+                             (the shares multiplier), which is why the price drifts above the \
+                             real stock's over time.",
+                        )
+                        .color(FAINT)
+                        .small(),
+                    );
+                }
+                _ => {
+                    ui.label(
+                        RichText::new("No dividend on file for this one.").color(FAINT).small(),
+                    );
+                }
             }
         }
     }
