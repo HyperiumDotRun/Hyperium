@@ -314,10 +314,22 @@ const WEBMANIFEST: &str = r##"{
 "##;
 
 pub(crate) fn tool_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
+    tool_button_inner(ui, label, enabled, None)
+}
+
+/// Same widget, plus a hover tooltip — for the handful of buttons whose
+/// label alone doesn't say what they'll actually do (a computed screener,
+/// say) rather than every button everywhere; most are self-explanatory and
+/// a tooltip on those would just be noise.
+pub(crate) fn tool_button_hint(ui: &mut egui::Ui, label: &str, enabled: bool, hint: &str) -> bool {
+    tool_button_inner(ui, label, enabled, Some(hint))
+}
+
+fn tool_button_inner(ui: &mut egui::Ui, label: &str, enabled: bool, hint: Option<&str>) -> bool {
     let font = FontId::new(14.0, FontFamily::Proportional);
     let w = ui.painter().layout_no_wrap(label.to_string(), font.clone(), FG).size().x + 28.0;
     let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 34.0), sense);
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(w, 34.0), sense);
     let hov = enabled && resp.hovered();
     let (fill, stroke, text) = if !enabled {
         (BG_ELEVATED, ACCENT_DIM, FAINT)
@@ -329,6 +341,9 @@ pub(crate) fn tool_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool
     ui.painter().rect_filled(rect, 8.0, fill);
     ui.painter().rect_stroke(rect, 8.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, font, text);
+    if let Some(h) = hint {
+        resp = resp.on_hover_text(h);
+    }
     enabled && resp.clicked()
 }
 

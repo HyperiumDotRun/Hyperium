@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::{Color32, FontId, RichText};
 
-use crate::tools::{ACCENT, BG_ELEVATED, DIM, FAINT, FG, RED, Tool, ToolCtx, tool_button};
+use crate::tools::{ACCENT, BG_ELEVATED, DIM, FAINT, FG, RED, Tool, ToolCtx, tool_button, tool_button_hint};
 
 use intent::Intent;
 
@@ -51,12 +51,39 @@ const ROW_HOVER: Color32 = Color32::from_rgb(34, 36, 41);
 /// through all three is a tour of everything the agent does. Written with bare
 /// tickers because the model resolves against the whitelist, and a starter that
 /// missed would teach the wrong lesson about what the agent accepts.
-const EXAMPLES: &[&str] = &[
-    "price of WETH",
-    "1 WETH in USDG",
-    "what's heating up on Robinhood Chain",
-    "which Ondo stock has unusual volume",
-    "any Ondo stock near a 52-week high",
+/// One "try" chip in the composer. `hint` is a hover tooltip, kept for only
+/// the examples whose label alone doesn't say what's actually happening
+/// behind it (a computed screener) — a plain lookup or swap doesn't need
+/// one, that's exactly what it looks like.
+struct Example {
+    text: &'static str,
+    hint: Option<&'static str>,
+}
+
+const EXAMPLES: &[Example] = &[
+    Example { text: "price of WETH", hint: None },
+    Example { text: "1 WETH in USDG", hint: None },
+    Example {
+        text: "what's heating up on Robinhood Chain",
+        hint: Some(
+            "Ranks every token by last hour's volume against its own normal hourly \
+             pace — a real ratio computed in Rust, not a guess.",
+        ),
+    },
+    Example {
+        text: "which Ondo stock has unusual volume",
+        hint: Some(
+            "Scans all of Ondo's supported assets in one call and ranks them by \
+             today's volume against each one's own average.",
+        ),
+    },
+    Example {
+        text: "any Ondo stock near a 52-week high",
+        hint: Some(
+            "Uses each stock's real 52-week high/low to find how close today's \
+             price sits to either edge.",
+        ),
+    },
 ];
 
 /// Phrases cycled while a request is in flight. They name the step actually
@@ -2669,23 +2696,27 @@ impl SushiTool {
             ui.add_space(8.0);
         }
 
-        // Starters, because the hardest part of a blank box is the first
-        // question — shown only before the first turn, same as a fresh
-        // ChatGPT/Claude conversation. Clicking one asks it outright rather
-        // than only filling the field.
-        if self.chat.is_empty() && !busy {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("try").color(FAINT).small());
-                for q in EXAMPLES {
-                    if tool_button(ui, q, has_ai && !busy) && has_ai && !busy {
-                        self.ask = (*q).to_string();
-                        let ctx = ui.ctx().clone();
-                        self.ask_model(&ctx);
-                    }
+        // Starters — always visible, not just before the first turn: the
+        // agent picked up several screeners over time (chain_screen,
+        // ondo_screen...) that are easy to forget are even there once a
+        // conversation is under way, so the reminder stays up rather than
+        // vanishing the moment it might actually be useful.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("try").color(FAINT).small());
+            for ex in EXAMPLES {
+                let ready = has_ai && !busy;
+                let clicked = match ex.hint {
+                    Some(h) => tool_button_hint(ui, ex.text, ready, h),
+                    None => tool_button(ui, ex.text, ready),
+                };
+                if clicked && ready {
+                    self.ask = ex.text.to_string();
+                    let ctx = ui.ctx().clone();
+                    self.ask_model(&ctx);
                 }
-            });
-            ui.add_space(8.0);
-        }
+            }
+        });
+        ui.add_space(8.0);
 
         ui.horizontal(|ui| {
             // Idle it breathes; working it runs. The panel should look awake
