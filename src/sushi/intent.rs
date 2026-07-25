@@ -57,6 +57,15 @@ pub enum Intent {
         /// the amount back, and that echo is what gets displayed.
         amount_raw: u128,
     },
+    /// One Ondo Stocks ticker (`TSLA`/`TSLAon`) — a reference read from
+    /// Ondo's own API, not Robinhood Chain data. Kept as a bare ticker
+    /// string rather than resolved against a registry: unlike the curated
+    /// `Chain`/`Token` whitelist, `ondo.rs` normalizes and validates the
+    /// symbol itself, since the set of Ondo Stocks isn't known ahead of time
+    /// here.
+    StockLookup {
+        ticker: String,
+    },
 }
 
 /// Reads `input["chain"]` (defaulting to Ethereum) against the curated

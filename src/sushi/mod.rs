@@ -15,6 +15,7 @@ mod erc20;
 mod trending;
 mod intent;
 mod market;
+mod ondo;
 mod signer;
 mod tokens;
 
@@ -26,6 +27,7 @@ pub fn sign_worker_main(cfg: &std::path::Path) -> i32 {
     signer::run_worker(cfg)
 }
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -128,17 +130,27 @@ windows), lookup_token (everything on one Robinhood Chain ticker — works for A
 there, including ones minutes old — and is also what puts up the swap card the user can \
 act on), get_price and get_quote (restricted to this short curated whitelist only:\n{}\
 wallet_balance (the imported wallet's real on-chain balance of one token, read live — this \
-is the ONLY way you ever know what's in the wallet). Prefer screen_chain over \
-market_overview when Robinhood Chain is what's actually meant, since it has finer windows \
-market_overview structurally can't. Prefer lookup_token over get_price/get_quote for \
-anything not in that whitelist above — that's the common case, not the exception, for \
-tokens on this chain.
+is the ONLY way you ever know what's in the wallet), execute_swap (actually sends a swap on \
+Robinhood Chain from the imported wallet — see the paragraph below on when to call it), \
+lookup_stock (reference price for one Ondo Finance tokenized US stock — TSLA/TSLAon, \
+AAPL/AAPLon, etc). Prefer screen_chain over market_overview when Robinhood Chain is what's \
+actually meant, since it has finer windows market_overview structurally can't. Prefer \
+lookup_token over get_price/get_quote for anything not in that whitelist above — that's the \
+common case, not the exception, for tokens on this chain.
+
+Ondo Finance's tokenized stocks are a completely separate thing from everything else here: a \
+different chain (Ethereum/BNB/Solana, not Robinhood Chain), a different product, no swap card, \
+no trading. If someone asks about a tokenized stock or something that sounds like a ticker \
+with \"on\" tacked on (TSLAon, AAPLon...), or explicitly says \"Ondo\", call lookup_stock and \
+give them the reference price plainly — but say clearly this app can't trade it (yet), rather \
+than implying a Buy button exists somewhere for it. Don't confuse this with Robinhood Chain's \
+own tokenized-equities tokens, which DO trade here via lookup_token like anything else on \
+that chain — if it's ambiguous which one someone means, ask.
 
 If someone names two tokens and wants to swap between them and one isn't on the \
 get_price/get_quote whitelist, don't just refuse — call lookup_token on the one they want \
-to receive, and say plainly that swaps in this app run from WETH (there's no \"pick your \
-own input token\" yet), so what you can set up is WETH into that token, not a swap from \
-whatever they said they're holding.
+to receive, then execute_swap with whichever token they said they're holding as token_in \
+(check wallet_balance first if you're not sure the wallet actually holds it).
 
 Never invent a number — every price, volume, quote, or balance in a reply came from one of \
 these tools this turn or a tool call earlier in the conversation, never from memory. This \
@@ -158,15 +170,17 @@ balance as the obvious default. There is no balance/holdings view anywhere else 
 app's UI: never claim one exists or tell someone to go look for it there. If wallet_balance \
 itself fails or no wallet is imported, say that plainly instead of making something up.
 
-How swapping actually works here, if asked: type a ticker or say what to swap in plain \
-English; lookup_token puts up a card with a live preview of Sushi's route; hitting Swap \
-brings up an in-app confirmation panel showing the exact amount, recipient and gas, and \
-nothing is signed until that's explicitly confirmed there. You can explain all of this, \
-walk someone through it, and call the tools that get the right card on screen — but you \
-cannot click Swap or confirm anything yourself; that step is always the human's, done \
-outside this conversation, on purpose. If no wallet is imported yet, \"Import wallet\" is \
-in the bar above the message box — the key is encrypted on this machine and only a \
-short-lived signing process ever touches it, never this chat.",
+How swapping actually works here: say what to swap in plain English — \"swap 0.5 ETH for \
+PONS\" — and call execute_swap directly rather than only describing the card; you don't \
+need to ask permission first if the request was already clear, since the app itself still \
+stops for a human before anything moves. That tool sends the transaction up to the exact \
+same point every manual swap does: an in-app confirmation panel showing the real amount, \
+recipient and gas, which the user has to explicitly approve there before anything is \
+signed — you cannot skip or auto-answer that panel, it's outside this conversation on \
+purpose, and execute_swap simply waits (or reports back cleanly if it's cancelled or times \
+out after ten minutes). If no wallet is imported yet, \"Import wallet\" is in the bar above \
+the message box — the key is encrypted on this machine and only a short-lived signing \
+process ever touches it, never this chat.",
         tokens::catalog()
     )
 }
@@ -179,6 +193,10 @@ const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(450);
 const LOG_MAX: usize = 20;
 const MARKET_ROWS: usize = 10;
 const MARKET_TTL: Duration = Duration::from_secs(60);
+/// How long a row's price stays tinted after it changes between refreshes —
+/// there is no live tick, so this is the one honest signal that a number just
+/// moved rather than having always been what it now shows.
+const FLASH_DURATION: Duration = Duration::from_millis(900);
 
 // Table geometry. Numeric columns are right-aligned inside their width so the
 // decimal points line up down the column.
@@ -209,6 +227,16 @@ const T_AGE: f32 = 66.0;
 const T_TABLE_W: f32 =
     T_RANK + T_SYM + T_DEX + T_PRICE + T_CHG + T_VOL1H + T_VOL + T_LIQ + T_AGE;
 
+// Ondo Stocks dashboard. No volume field exists in Ondo's `market` response,
+// so the name column takes the room the market table gives volume instead.
+const O_RANK: f32 = 30.0;
+const O_SYM: f32 = 74.0;
+const O_NAME: f32 = 240.0;
+const O_PRICE: f32 = 116.0;
+const O_CHG: f32 = 88.0;
+const O_SPARK: f32 = 140.0;
+const O_TABLE_W: f32 = O_RANK + O_SYM + O_NAME + O_PRICE + O_CHG + O_SPARK;
+
 enum Outcome {
     Price { chain: &'static str, symbol: String, address: String, usd: f64 },
     /// A ticker looked up on the chain, with the agent's read of it. The take
@@ -229,6 +257,12 @@ enum Outcome {
     /// code shows it — the model never invents the numbers in `reply`, it's
     /// just the one putting them into a sentence.
     Chat { reply: String, card: Option<Box<Outcome>> },
+    /// A reference read from Ondo Finance's tokenized-stocks API — a
+    /// *different* chain and product from everything else in this file
+    /// (Ondo Stocks live on Ethereum/BNB/Solana, not Robinhood Chain).
+    /// Informational only: there is no swap card, no mint/redeem, nothing to
+    /// click here yet — see `ondo.rs`.
+    Stock { symbol: String, name: Option<String>, price_usd: f64, change_24h: Option<f64> },
 }
 
 /// What a completed swap actually did, re-read from the chain side rather
@@ -340,6 +374,9 @@ fn chat_reply(outcome: &Outcome) -> String {
             None => "Nothing came back for that.".to_string(),
         },
         Outcome::Token { .. } | Outcome::Screen { .. } => String::new(),
+        Outcome::Stock { symbol, price_usd, .. } => {
+            format!("{symbol} is at {} on Ondo (reference price, not tradable here).", market::money_price(*price_usd))
+        }
     }
 }
 
@@ -359,11 +396,28 @@ struct ChatTurn {
     answer: ChatAnswer,
 }
 
+/// The three faces of the panel — split because a chat box asking "what's
+/// pumping" and a dashboard row you scan at a glance want different amounts
+/// of screen, and forcing both into one long scroll made the composer's
+/// place on screen unpredictable. All three still answer through the same
+/// `chat` vector: picking a row still asks the agent, it just no longer
+/// shows the question-and-answer bubbles on top of the table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Tab {
+    #[default]
+    Chat,
+    Robinhood,
+    Ondo,
+}
+
 pub struct SushiTool {
+    active_tab: Tab,
     ask: String,
     ticker: String,
     sushi_key: String,
-    key_open: bool,
+    /// Ondo Finance's `x-api-key`, stored the same way as `sushi_key` — see
+    /// `ondo_key_path`.
+    ondo_key: String,
     loaded: bool,
     /// Saved value, mirrors `config_dir/anthropic.key`.
     ai_key: String,
@@ -402,6 +456,22 @@ pub struct SushiTool {
     trending_rx: Option<Receiver<Result<Vec<trending::Row>, String>>>,
     trending_err: Option<String>,
     trending_at: Option<Instant>,
+    /// Symbol -> (when it last changed, whether it went up), pruned once
+    /// `FLASH_DURATION` has passed. Diffed against the previous snapshot the
+    /// moment a refresh lands (`poll`), not while drawing — by the time a row
+    /// paints, "did this change" has to already be a fact, not a comparison
+    /// happening mid-frame against whatever `self.market` was replaced with.
+    market_flash: HashMap<String, (Instant, bool)>,
+    trending_flash: HashMap<String, (Instant, bool)>,
+
+    /// Ondo Stocks dashboard — a curated large-cap list, refreshed the same
+    /// way as `market`/`trending`, but each row is its own request against
+    /// `ondo::market` (no bulk endpoint exists), fanned out on one thread.
+    ondo: Vec<ondo::Market>,
+    ondo_rx: Option<Receiver<Vec<ondo::Market>>>,
+    ondo_err: Option<String>,
+    ondo_at: Option<Instant>,
+    ondo_flash: HashMap<String, (Instant, bool)>,
 
     /// The imported wallet's address — `None` until a key is imported
     /// (`signer::set_key`), either just now or on an earlier run
@@ -462,10 +532,11 @@ pub struct SushiTool {
 impl Default for SushiTool {
     fn default() -> Self {
         Self {
+            active_tab: Tab::default(),
             ask: String::new(),
             ticker: String::new(),
             sushi_key: String::new(),
-            key_open: false,
+            ondo_key: String::new(),
             loaded: false,
             ai_key: String::new(),
             ai_input: String::new(),
@@ -485,6 +556,14 @@ impl Default for SushiTool {
             trending_rx: None,
             trending_err: None,
             trending_at: None,
+            market_flash: HashMap::new(),
+            trending_flash: HashMap::new(),
+
+            ondo: Vec::new(),
+            ondo_rx: None,
+            ondo_err: None,
+            ondo_at: None,
+            ondo_flash: HashMap::new(),
 
             wallet: None,
             wallet_err: None,
@@ -512,6 +591,10 @@ impl Default for SushiTool {
 
 fn sushi_key_path(cfg: &std::path::Path) -> std::path::PathBuf {
     cfg.join("sushi.key")
+}
+
+fn ondo_key_path(cfg: &std::path::Path) -> std::path::PathBuf {
+    cfg.join("ondo.key")
 }
 
 /// Flattens the board into the same fields it renders — symbol, price, 24h
@@ -555,7 +638,7 @@ fn screen_brief(rows: &[trending::Row], window: trending::Window) -> String {
 
 /// Execute an already-resolved intent. Past this point nothing invents a
 /// number — every branch either calls a real API or fails.
-fn run(intent: Intent, api_key: &str, ai_key: &str) -> Result<Outcome, String> {
+fn run(intent: Intent, api_key: &str, ai_key: &str, ondo_key: &str) -> Result<Outcome, String> {
     match intent {
         Intent::TokenLookup { ticker } => {
             let info = trending::lookup(&ticker)?;
@@ -605,6 +688,15 @@ fn run(intent: Intent, api_key: &str, ai_key: &str) -> Result<Outcome, String> {
                 api_key,
             )?;
             Ok(Outcome::Quote { chain: chain.name, quote })
+        }
+        Intent::StockLookup { ticker } => {
+            let m = ondo::market(&ticker, ondo_key)?;
+            Ok(Outcome::Stock {
+                symbol: m.symbol,
+                name: m.name,
+                price_usd: m.price_usd,
+                change_24h: m.change_24h,
+            })
         }
     }
 }
@@ -697,6 +789,41 @@ fn agent_tools() -> Vec<crate::llm::ToolSpec> {
             }),
         },
         crate::llm::ToolSpec {
+            name: "lookup_stock",
+            description: "Reference price for one Ondo Finance tokenized US stock (e.g. \
+                TSLA/TSLAon, AAPL/AAPLon) — a completely different chain and product from \
+                everything else here (Ondo Stocks live on Ethereum/BNB/Solana, not Robinhood \
+                Chain). Informational only: there is no swap card, no trading, nothing to \
+                click here for these — just say the numbers if asked. Only call this for \
+                stock/equity tickers explicitly framed as Ondo/tokenized-stock questions, not \
+                for anything on Robinhood Chain (use lookup_token for that).",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "ticker": { "type": "string", "description": "e.g. \"TSLA\" or \"TSLAon\"" } },
+                "required": ["ticker"]
+            }),
+        },
+        crate::llm::ToolSpec {
+            name: "execute_swap",
+            description: "Actually swap on Robinhood Chain from the imported wallet — this \
+                sends a real transaction, not a preview. Safe to call as soon as the user has \
+                clearly asked for a swap; it always stops at the app's own confirmation panel \
+                (exact amount, recipient, gas) before anything is signed, so this tool doing \
+                the asking rather than the user clicking a card doesn't skip that check. \
+                token_in must be something the wallet actually holds — call wallet_balance \
+                first if that's not already established this conversation. token_out is \
+                resolved the same way lookup_token resolves it.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "token_in": { "type": "string", "description": "symbol already held, e.g. \"ETH\" or \"WETH\"" },
+                    "token_out": { "type": "string", "description": "ticker to receive, e.g. \"PONS\"" },
+                    "amount": { "type": "string", "description": "plain decimal amount of token_in, e.g. \"0.5\"" }
+                },
+                "required": ["token_in", "token_out", "amount"]
+            }),
+        },
+        crate::llm::ToolSpec {
             name: "wallet_balance",
             description: "The imported wallet's real on-chain balance of one token on \
                 Robinhood Chain, read directly from the chain (never from memory, never \
@@ -745,6 +872,21 @@ fn tool_result_text(outcome: &Outcome) -> String {
             )
         }
         Outcome::Chat { reply, .. } => reply.clone(),
+        Outcome::Stock { symbol, name, price_usd, change_24h } => {
+            let chg = change_24h.map(|c| format!(", 24h {c:+.2}%")).unwrap_or_default();
+            match name {
+                Some(n) => format!(
+                    "{symbol} ({n}) on Ondo Finance = {}{chg} (reference price, not tradable \
+                     from this app)",
+                    market::money_price(*price_usd)
+                ),
+                None => format!(
+                    "{symbol} on Ondo Finance = {}{chg} (reference price, not tradable from \
+                     this app)",
+                    market::money_price(*price_usd)
+                ),
+            }
+        }
     }
 }
 
@@ -796,6 +938,75 @@ fn wallet_balance_text(wallet: Option<&str>, ticker: &str) -> String {
             Ok(s) => s,
             Err(e) => format!("error: {e}"),
         },
+    }
+}
+
+/// The agent's own path into `run_local_swap_job` — same function the manual
+/// Swap button calls, same `pending_confirm` gate, same ten-minute timeout.
+/// Called from the tool-loop thread (`ask_model`'s job closure), which is
+/// already a background thread, so blocking here on the human's answer to
+/// the confirmation panel is exactly the pattern `run_swap` already uses,
+/// just reached from a different door.
+fn execute_swap_text(
+    input: &serde_json::Value,
+    wallet: Option<&str>,
+    api_key: &str,
+    busy: bool,
+    pending: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
+    swap_step: std::sync::Arc<std::sync::Mutex<SwapStep>>,
+) -> String {
+    let Some(sender) = wallet else {
+        return "no wallet imported yet — the user needs to click \"Import wallet\" first".into();
+    };
+    if busy {
+        return "a swap is already in progress in this app — wait for it to finish first".into();
+    }
+    let Some(chain) = tokens::chain_by_name(trending::CHAIN_NAME) else {
+        return "error: chain not configured".into();
+    };
+    let token_in = input["token_in"].as_str().unwrap_or_default().trim();
+    let token_out_ticker = input["token_out"].as_str().unwrap_or_default().trim();
+    let amount = input["amount"].as_str().unwrap_or_default().trim();
+    if token_in.is_empty() || token_out_ticker.is_empty() || amount.is_empty() {
+        return "error: token_in, token_out and amount are all required".into();
+    }
+    let Some((in_address, in_decimals)) = resolve_source_token(chain, token_in) else {
+        return format!(
+            "error: \"{token_in}\" isn't a token this wallet can swap from here — check \
+             wallet_balance for what it actually holds"
+        );
+    };
+    let info = match trending::lookup(token_out_ticker) {
+        Ok(i) => i,
+        Err(e) => return format!("error: couldn't find {token_out_ticker} on Robinhood Chain — {e}"),
+    };
+    let amount_raw = match tokens::parse_units(amount, in_decimals) {
+        Ok(0) => return "error: amount is zero".into(),
+        Ok(v) => v,
+        Err(e) => return format!("error: {e}"),
+    };
+
+    let set = move |s: SwapStep| *swap_step.lock().unwrap() = s;
+    match run_local_swap_job(
+        chain.id,
+        in_address,
+        &info.address,
+        amount_raw,
+        sender,
+        api_key,
+        info.symbol.clone(),
+        set,
+        pending,
+    ) {
+        Ok(done) => format!(
+            "swap sent: {} {} -> {} {} (tx {})",
+            market::token_amount(&done.sent),
+            done.sent_symbol,
+            market::token_amount(&done.expected_out),
+            done.got_symbol,
+            done.tx_hash,
+        ),
+        Err(e) => format!("swap failed: {e}"),
     }
 }
 
@@ -851,41 +1062,57 @@ fn resolve_source_token(chain: &'static tokens::Chain, symbol: &str) -> Option<(
     chain.token(symbol).map(|t| (t.address, t.decimals))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_tool(
     name: &str,
     input: &serde_json::Value,
     api_key: &str,
+    ondo_key: &str,
     wallet: Option<&str>,
+    swap_busy: bool,
+    pending_confirm: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
+    swap_step: std::sync::Arc<std::sync::Mutex<SwapStep>>,
     last_card: &std::cell::RefCell<Option<Outcome>>,
 ) -> String {
     if name == "wallet_balance" {
         return wallet_balance_text(wallet, input["ticker"].as_str().unwrap_or(""));
     }
+    if name == "execute_swap" {
+        return execute_swap_text(input, wallet, api_key, swap_busy, pending_confirm, swap_step);
+    }
     let result: Result<Outcome, String> = match name {
         "market_overview" => {
             let sort = input["sort"].as_str().and_then(market::Sort::parse).unwrap_or(market::Sort::Volume);
             let limit = input["limit"].as_u64().unwrap_or(10).clamp(1, market::LIMIT_MAX as u64) as usize;
-            run(Intent::Market { sort, limit }, api_key, "")
+            run(Intent::Market { sort, limit }, api_key, "", "")
         }
         "screen_chain" => {
             let limit = input["limit"].as_u64().unwrap_or(20).clamp(1, intent::SCREEN_LIMIT_MAX as u64) as usize;
             let window = input["window"].as_str().and_then(trending::Window::parse).unwrap_or(trending::Window::H24);
-            run(Intent::ChainScreen { limit, window }, api_key, "")
+            run(Intent::ChainScreen { limit, window }, api_key, "", "")
         }
         "lookup_token" => {
             let ticker = input["ticker"].as_str().unwrap_or_default().trim().trim_start_matches('$').to_string();
             if ticker.is_empty() {
                 Err("no ticker given".to_string())
             } else {
-                run(Intent::TokenLookup { ticker }, api_key, "")
+                run(Intent::TokenLookup { ticker }, api_key, "", "")
             }
         }
         "get_price" => (|| {
             let chain = intent::chain_of(input)?;
             let token = intent::token_of(chain, input, "token")?;
-            run(Intent::Price { chain, token }, api_key, "")
+            run(Intent::Price { chain, token }, api_key, "", "")
         })(),
-        "get_quote" => intent::quote_of(input).and_then(|i| run(i, api_key, "")),
+        "get_quote" => intent::quote_of(input).and_then(|i| run(i, api_key, "", "")),
+        "lookup_stock" => {
+            let ticker = input["ticker"].as_str().unwrap_or_default().trim().to_string();
+            if ticker.is_empty() {
+                Err("no ticker given".to_string())
+            } else {
+                run(Intent::StockLookup { ticker }, "", "", ondo_key)
+            }
+        }
         other => Err(format!("unknown tool {other}")),
     };
     match result {
@@ -1084,6 +1311,20 @@ impl SushiTool {
             let _ = tx.send(trending::fetch(TRENDING_ROWS, trending::Window::H24));
         });
         self.trending_rx = Some(rx);
+        ctx.request_repaint();
+    }
+
+    /// No key required — `ondo::market` falls through to Hyperium's shared
+    /// proxy for a blank key, which is what every row here passes.
+    fn refresh_ondo(&mut self, ctx: &egui::Context) {
+        if self.ondo_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ondo::dashboard(ondo::DASHBOARD_TICKERS));
+        });
+        self.ondo_rx = Some(rx);
         ctx.request_repaint();
     }
 
@@ -1309,7 +1550,7 @@ impl SushiTool {
         // Same intent the chat path reaches for the same question — the box
         // and a typed question are two doors onto one lookup, not two.
         self.spawn(ctx, label, move || {
-            run(Intent::TokenLookup { ticker }, &api_key, &ai_key)
+            run(Intent::TokenLookup { ticker }, &api_key, &ai_key, "")
         });
     }
 
@@ -1327,8 +1568,16 @@ impl SushiTool {
         self.ask.clear();
         let ai_key = self.ai_key.clone();
         let api_key = self.sushi_key.clone();
+        let ondo_key = self.ondo_key.clone();
         let wallet = self.wallet.clone();
         let messages = self.agent_messages.clone();
+        // A swap already running (from the card's own button, or a previous
+        // execute_swap call) is checked here, once, before the thread starts
+        // — not inside `execute_swap_text` on every call — since this is the
+        // one place that still has `self.swap_rx` to ask.
+        let swap_busy = self.swap_rx.is_some();
+        let pending_confirm = self.pending_confirm.clone();
+        let swap_step = self.swap_step.clone();
         self.spawn(ctx, question.clone(), move || {
             let last_card = std::cell::RefCell::new(None);
             // Sonnet, not the default Haiku: this agent has to reliably call a
@@ -1340,7 +1589,17 @@ impl SushiTool {
             guard.push(serde_json::json!({ "role": "user", "content": question }));
             let system = agent_system_prompt();
             let reply = anthropic.converse(&system, &mut guard, &tools, |name, input| {
-                dispatch_tool(name, input, &api_key, wallet.as_deref(), &last_card)
+                dispatch_tool(
+                    name,
+                    input,
+                    &api_key,
+                    &ondo_key,
+                    wallet.as_deref(),
+                    swap_busy,
+                    pending_confirm.clone(),
+                    swap_step.clone(),
+                    &last_card,
+                )
             })?;
             drop(guard);
             Ok(Outcome::Chat { reply, card: last_card.into_inner().map(Box::new) })
@@ -1371,6 +1630,7 @@ impl SushiTool {
             Ok(Outcome::Screen { rows, .. }) => {
                 (format!("screened {} Robinhood Chain tokens", rows.len()), true)
             }
+            Ok(Outcome::Stock { symbol, .. }) => (format!("read {symbol} on Ondo"), true),
             Ok(Outcome::Chat { card, .. }) => (
                 match card.as_deref() {
                     Some(Outcome::Token { info, .. }) => format!("chatted, read {}", info.symbol),
@@ -1410,6 +1670,7 @@ impl SushiTool {
         if let Some(rx) = &self.market_rx {
             match rx.try_recv() {
                 Ok(Ok(rows)) => {
+                    note_flashes(&mut self.market_flash, &self.market, &rows, |r| &r.symbol, |r| r.price);
                     self.market = rows;
                     self.market_err = None;
                     self.market_at = Some(Instant::now());
@@ -1427,6 +1688,13 @@ impl SushiTool {
         if let Some(rx) = &self.trending_rx {
             match rx.try_recv() {
                 Ok(Ok(rows)) => {
+                    note_flashes(
+                        &mut self.trending_flash,
+                        &self.trending,
+                        &rows,
+                        |r| &r.symbol,
+                        |r| r.price_usd,
+                    );
                     self.trending = rows;
                     self.trending_err = None;
                     self.trending_at = Some(Instant::now());
@@ -1439,6 +1707,19 @@ impl SushiTool {
                 }
                 Err(TryRecvError::Empty) => ui.ctx().request_repaint(),
                 Err(TryRecvError::Disconnected) => self.trending_rx = None,
+            }
+        }
+        if let Some(rx) = &self.ondo_rx {
+            match rx.try_recv() {
+                Ok(rows) => {
+                    note_flashes(&mut self.ondo_flash, &self.ondo, &rows, |r| &r.symbol, |r| r.price_usd);
+                    self.ondo_err = if rows.is_empty() { Some("no symbols answered".into()) } else { None };
+                    self.ondo = rows;
+                    self.ondo_at = Some(Instant::now());
+                    self.ondo_rx = None;
+                }
+                Err(TryRecvError::Empty) => ui.ctx().request_repaint(),
+                Err(TryRecvError::Disconnected) => self.ondo_rx = None,
             }
         }
         if let Some(rx) = &self.swap_rx {
@@ -1511,10 +1792,14 @@ impl SushiTool {
             return;
         }
 
+        if !self.trending_flash.is_empty() {
+            ui.ctx().request_repaint();
+        }
         trending_header(ui);
         let mut picked = None;
         for (i, row) in self.trending.iter().enumerate() {
-            if trending_row(ui, i, row) {
+            let flash = self.trending_flash.get(&row.symbol);
+            if trending_row(ui, i, row, flash) {
                 picked = Some(row.symbol.clone());
             }
         }
@@ -1560,19 +1845,74 @@ impl SushiTool {
             return;
         }
 
+        if !self.market_flash.is_empty() {
+            ui.ctx().request_repaint();
+        }
         table_header(ui);
         for (i, row) in self.market.iter().enumerate() {
-            market_row(ui, i, row);
+            let flash = self.market_flash.get(&row.symbol);
+            market_row(ui, i, row, flash);
+        }
+    }
+
+    /// Ondo Stocks — reference prices only (see `ondo.rs`): no swap card,
+    /// no click-through, just what the fixed watchlist is doing right now.
+    fn ondo_section(&mut self, ui: &mut egui::Ui) {
+        let loading = self.ondo_rx.is_some();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("ONDO STOCKS").color(ACCENT).small().strong());
+            ui.label(RichText::new("tokenized US equities · reference only").color(FAINT).small());
+            if loading {
+                ui.add(egui::Spinner::new().size(13.0).color(ACCENT));
+            } else if let Some(at) = self.ondo_at {
+                ui.label(RichText::new(ago(at.elapsed().as_secs())).color(FAINT).small());
+            }
+            if tool_button(ui, "Refresh", !loading) && !loading {
+                let ctx = ui.ctx().clone();
+                self.refresh_ondo(&ctx);
+            }
+        });
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(
+                "TSLAon, AAPLon and the rest of Ondo's on-chain stock trackers — read through \
+                 Hyperium's own shared key, so this works with no Ondo API key of your own. \
+                 Prices drift slightly above the real stock over time (dividends compound in \
+                 rather than pay out); nothing here is tradable from this app yet.",
+            )
+            .color(DIM)
+            .small(),
+        );
+        ui.add_space(8.0);
+
+        if let Some(e) = &self.ondo_err {
+            ui.label(RichText::new(format!("✗ {e}")).color(RED).small());
+        }
+        if self.ondo.is_empty() {
+            if self.ondo_err.is_none() {
+                ui.label(RichText::new("loading…").color(FAINT).small());
+            }
+            return;
+        }
+        if !self.ondo_flash.is_empty() {
+            ui.ctx().request_repaint();
+        }
+
+        ondo_header(ui);
+        for (i, row) in self.ondo.iter().enumerate() {
+            let flash = self.ondo_flash.get(&row.symbol);
+            ondo_row(ui, i, row, flash);
         }
     }
 }
 
 impl Tool for SushiTool {
     fn title(&self) -> &'static str {
-        "Sushi agent"
+        "AI Agent"
     }
     fn about(&self) -> &'static str {
-        "Tell it what to swap — it prices the best route through Sushi and shows you before you sign."
+        "Chat, trade on Robinhood Chain, and check Ondo's tokenized stocks — one agent, three tabs."
     }
     fn uses_output_dir(&self) -> bool {
         false
@@ -1582,6 +1922,7 @@ impl Tool for SushiTool {
         if !self.loaded {
             self.ai_key = crate::secret::load_secret(&octx.config_dir.join("anthropic.key"));
             self.sushi_key = crate::secret::load_secret(&sushi_key_path(octx.config_dir));
+            self.ondo_key = crate::secret::load_secret(&ondo_key_path(octx.config_dir));
             // No "connect" handshake needed — if a key's already imported,
             // the wallet is simply already here.
             self.wallet = signer::address(octx.config_dir);
@@ -1589,6 +1930,7 @@ impl Tool for SushiTool {
             let ctx = ui.ctx().clone();
             self.refresh_market(&ctx);
             self.refresh_trending(&ctx);
+            self.refresh_ondo(&ctx);
         }
 
         self.poll(ui);
@@ -1597,7 +1939,8 @@ impl Tool for SushiTool {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
 
-        // Keep the table warm without the user asking.
+        // Keep every table warm without the user asking, whichever tab they
+        // are actually looking at.
         let stale = self.market_at.map(|t| t.elapsed() >= MARKET_TTL).unwrap_or(false);
         if stale && self.market_rx.is_none() {
             let ctx = ui.ctx().clone();
@@ -1608,45 +1951,160 @@ impl Tool for SushiTool {
             let ctx = ui.ctx().clone();
             self.refresh_trending(&ctx);
         }
-        if self.market_at.is_some() || self.trending_at.is_some() {
+        let ondo_stale = self.ondo_at.map(|t| t.elapsed() >= MARKET_TTL).unwrap_or(false);
+        if ondo_stale && self.ondo_rx.is_none() {
+            let ctx = ui.ctx().clone();
+            self.refresh_ondo(&ctx);
+        }
+        if self.market_at.is_some() || self.trending_at.is_some() || self.ondo_at.is_some() {
             ui.ctx().request_repaint_after(Duration::from_secs(1));
         }
         self.maybe_fetch_holdings(&ui.ctx().clone());
 
-        // The composer is pinned to the bottom of the panel, chat-app style —
-        // it needs to be claimed before the scroll area below so it always
-        // gets its strip regardless of how tall the conversation grows.
-        egui::Panel::bottom("sushi_composer")
-            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(0, 10)))
-            .show_separator_line(true)
-            .show_inside(ui, |ui| {
-                self.composer(ui, octx);
-            });
+        self.tab_bar(ui);
 
-        // The conversation leads. Everything below it is the reference
-        // material you consult after asking, not before.
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            self.chat_thread(ui);
+        match self.active_tab {
+            Tab::Chat => {
+                // The composer is pinned to the bottom of the panel, chat-app
+                // style — it needs to be claimed before the scroll area below
+                // so it always gets its strip regardless of how tall the
+                // conversation grows. Only mounted on this tab: the other two
+                // have their own, narrower ways in (a ticker box, nothing).
+                egui::Panel::bottom("sushi_composer")
+                    .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(0, 10)))
+                    .show_separator_line(true)
+                    .show_inside(ui, |ui| {
+                        self.composer(ui, octx);
+                    });
 
-            ui.add_space(14.0);
-            self.log_and_settings(ui, octx);
+                egui::ScrollArea::vertical().id_salt("chat_scroll").show(ui, |ui| {
+                    self.chat_thread(ui);
+                    ui.add_space(14.0);
+                    self.log_and_settings(ui, octx);
+                });
+            }
+            Tab::Robinhood => {
+                egui::ScrollArea::vertical().id_salt("robinhood_scroll").show(ui, |ui| {
+                    self.robinhood_lookup_bar(ui);
+                    self.robinhood_card(ui);
 
-            ui.add_space(18.0);
-            ui.separator();
-            ui.add_space(14.0);
+                    ui.add_space(18.0);
+                    ui.separator();
+                    ui.add_space(14.0);
+                    self.trending_section(ui);
 
-            self.trending_section(ui);
-
-            ui.add_space(18.0);
-            ui.separator();
-            ui.add_space(14.0);
-
-            self.market_section(ui);
-        });
+                    ui.add_space(18.0);
+                    ui.separator();
+                    ui.add_space(14.0);
+                    self.market_section(ui);
+                });
+            }
+            Tab::Ondo => {
+                egui::ScrollArea::vertical().id_salt("ondo_scroll").show(ui, |ui| {
+                    self.ondo_section(ui);
+                });
+            }
+        }
     }
 }
 
 impl SushiTool {
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (tab, label) in
+                [(Tab::Chat, "Chat"), (Tab::Robinhood, "Robinhood"), (Tab::Ondo, "Ondo")]
+            {
+                let active = self.active_tab == tab;
+                let text = RichText::new(label).color(if active { ACCENT } else { DIM }).strong();
+                if ui.selectable_label(active, text).clicked() {
+                    self.active_tab = tab;
+                }
+            }
+        });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+    }
+
+    /// Robinhood tab's own way in — a bare ticker box, the same fast path
+    /// `submit` already gives a plain ticker (no model call, works with no AI
+    /// key). The free-text composer stays on the Chat tab; this dashboard
+    /// only ever asks one kind of question.
+    fn robinhood_lookup_bar(&mut self, ui: &mut egui::Ui) {
+        let busy = self.rx.is_some();
+        ui.horizontal(|ui| {
+            let field = ui.add_enabled(
+                !busy,
+                egui::TextEdit::singleline(&mut self.ticker)
+                    .hint_text("look up a ticker — \"PONS\", \"WETH\"…")
+                    .desired_width(240.0),
+            );
+            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let ready = !self.ticker.trim().is_empty() && !busy;
+            if (tool_button(ui, "Look up", ready) || (entered && ready)) && ready {
+                let ctx = ui.ctx().clone();
+                self.look_up(&ctx);
+            }
+            if busy {
+                ui.add(egui::Spinner::new().size(13.0).color(ACCENT));
+            }
+        });
+        ui.add_space(10.0);
+    }
+
+    /// The last turn's card, if it was a token lookup — the same swap card
+    /// `chat_thread` shows inline, just without the question/answer bubbles
+    /// around it, since this tab is the dashboard, not the transcript. Chat
+    /// questions still land in `self.chat` either way, so switching to the
+    /// Chat tab shows the exact same lookup as part of the conversation.
+    fn robinhood_card(&mut self, ui: &mut egui::Ui) {
+        if self.rx.is_some() {
+            ui.horizontal(|ui| thinking_line(ui, self.busy_since, ui.input(|i| i.time)));
+            return;
+        }
+        let Some(turn) = self.chat.last() else { return };
+        let ChatAnswer::Result(outcome) = &turn.answer else { return };
+        if as_token(outcome).is_none() {
+            return;
+        }
+
+        let step = self.swap_step.lock().unwrap().clone();
+        let action = egui::Frame::NONE
+            .fill(BG_ELEVATED)
+            .corner_radius(12.0)
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                render_outcome(
+                    ui,
+                    outcome,
+                    self.wallet.as_deref(),
+                    &mut self.swap_amount,
+                    self.swap_rx.is_some(),
+                    step.label(),
+                    &self.swap_result,
+                    self.preview.as_ref(),
+                    self.preview_err.as_deref().filter(|e| !e.is_empty()),
+                    self.preview_rx.is_some(),
+                    true,
+                    &self.holdings,
+                    &mut self.source_symbol,
+                )
+            })
+            .inner;
+        ui.add_space(14.0);
+
+        if let Some(action) = action {
+            let ctx = ui.ctx().clone();
+            self.run_swap(action.symbol, action.token_out, &ctx);
+        } else if self.wallet.is_some() && self.swap_rx.is_none() {
+            if let Some(info) = as_token(outcome) {
+                let addr = info.address.clone();
+                let ctx = ui.ctx().clone();
+                self.maybe_preview_quote(&addr, &ctx);
+            }
+        }
+    }
+
     /// The conversation, oldest first, chat-app style: your line right and
     /// tinted, its line left in the panel's own card colour. Only the last
     /// turn — and only if it's a lookup — gets live swap controls; everything
@@ -1776,38 +2234,63 @@ impl SushiTool {
             ui.add_space(10.0);
         }
 
-        let arrow = if self.key_open { "▾" } else { "▸" };
-        if ui
-            .add(
-                egui::Label::new(
-                    RichText::new(format!("{arrow} Sushi API key (optional)")).color(FAINT).small(),
-                )
-                .sense(egui::Sense::click()),
-            )
-            .clicked()
-        {
-            self.key_open = !self.key_open;
-        }
-        if self.key_open {
+        // `CollapsingHeader` rather than a hand-rolled arrow+label: it
+        // highlights on hover and shows a pointing-hand cursor for free,
+        // which a static label with a click `Sense` bolted on doesn't — that
+        // silence read as "not clickable" and is exactly what buried this
+        // section before.
+        egui::CollapsingHeader::new(RichText::new("Sushi API key (optional)").color(FAINT).small())
+            .id_salt("sushi_key_section")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.sushi_key)
+                            .password(true)
+                            .hint_text("sushi_…")
+                            .desired_width(240.0),
+                    );
+                    if tool_button(ui, "Save", true) {
+                        crate::secret::save_secret(&sushi_key_path(octx.config_dir), &self.sushi_key);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Raises rate limits.").color(FAINT).small());
+                    ui.hyperlink_to(
+                        RichText::new("get one ↗").color(ACCENT).small(),
+                        "https://www.sushi.com/portal",
+                    );
+                });
+            });
+
+        egui::CollapsingHeader::new(
+            RichText::new("Ondo Stocks API key (optional)").color(FAINT).small(),
+        )
+        .id_salt("ondo_key_section")
+        .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.sushi_key)
+                    egui::TextEdit::singleline(&mut self.ondo_key)
                         .password(true)
-                        .hint_text("sushi_…")
+                        .hint_text("x-api-key…")
                         .desired_width(240.0),
                 );
                 if tool_button(ui, "Save", true) {
-                    crate::secret::save_secret(&sushi_key_path(octx.config_dir), &self.sushi_key);
+                    crate::secret::save_secret(&ondo_key_path(octx.config_dir), &self.ondo_key);
                 }
             });
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Raises rate limits.").color(FAINT).small());
+                ui.label(
+                    RichText::new("Reference prices for tokenized US stocks (TSLAon, AAPLon…). \
+                        Not tradable from here yet — read-only.")
+                        .color(FAINT)
+                        .small(),
+                );
                 ui.hyperlink_to(
-                    RichText::new("get one ↗").color(ACCENT).small(),
-                    "https://www.sushi.com/portal",
+                    RichText::new("request access ↗").color(ACCENT).small(),
+                    "https://docs.ondo.finance/api-reference/quickstart",
                 );
             });
-        }
+        });
     }
 
     /// Dispatches one submitted line to whichever door it actually is —
@@ -2044,7 +2527,7 @@ fn table_header(ui: &mut egui::Ui) {
     p.text(egui::pos2(x, cy), egui::Align2::LEFT_CENTER, "7D", f, FAINT);
 }
 
-fn market_row(ui: &mut egui::Ui, i: usize, r: &market::Row) {
+fn market_row(ui: &mut egui::Ui, i: usize, r: &market::Row, flash: Option<&(Instant, bool)>) {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(TABLE_W, 26.0), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
@@ -2092,7 +2575,7 @@ fn market_row(ui: &mut egui::Ui, i: usize, r: &market::Row) {
         egui::Align2::RIGHT_CENTER,
         market::money_price(r.price),
         num.clone(),
-        FG,
+        flash_tint(FG, flash),
     );
 
     x += COL_CHG;
@@ -2115,6 +2598,82 @@ fn market_row(ui: &mut egui::Ui, i: usize, r: &market::Row) {
     let spark_rect = egui::Rect::from_min_size(
         egui::pos2(x + 12.0, rect.top() + 6.0),
         egui::vec2(COL_SPARK - 16.0, rect.height() - 12.0),
+    );
+    sparkline(p, spark_rect, &r.spark, chg_color);
+}
+
+fn ondo_header(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(O_TABLE_W, 20.0), egui::Sense::hover());
+    let p = ui.painter();
+    let cy = rect.center().y;
+    let f = FontId::proportional(10.5);
+    let mut x = rect.left() + 8.0;
+
+    x += O_RANK;
+    p.text(egui::pos2(x, cy), egui::Align2::LEFT_CENTER, "TICKER", f.clone(), FAINT);
+    x += O_SYM + O_NAME;
+    x += O_PRICE;
+    p.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, "PRICE", f.clone(), FAINT);
+    x += O_CHG;
+    p.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, "24H", f.clone(), FAINT);
+    x += 12.0;
+    p.text(egui::pos2(x, cy), egui::Align2::LEFT_CENTER, "TODAY", f, FAINT);
+}
+
+fn ondo_row(ui: &mut egui::Ui, i: usize, r: &ondo::Market, flash: Option<&(Instant, bool)>) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(O_TABLE_W, 26.0), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(rect, 4.0, ROW_HOVER);
+    }
+
+    let cy = rect.center().y;
+    let num = FontId::monospace(12.5);
+    let mut x = rect.left() + 8.0;
+
+    p.text(
+        egui::pos2(x, cy),
+        egui::Align2::LEFT_CENTER,
+        format!("{}", i + 1),
+        FontId::monospace(11.0),
+        FAINT,
+    );
+    x += O_RANK;
+
+    p.text(egui::pos2(x, cy), egui::Align2::LEFT_CENTER, &r.symbol, FontId::proportional(13.5), FG);
+    x += O_SYM;
+
+    p.text(
+        egui::pos2(x, cy),
+        egui::Align2::LEFT_CENTER,
+        truncate(r.name.as_deref().unwrap_or("—"), 34),
+        FontId::proportional(12.0),
+        DIM,
+    );
+    x += O_NAME;
+
+    x += O_PRICE;
+    p.text(
+        egui::pos2(x, cy),
+        egui::Align2::RIGHT_CENTER,
+        market::money_price(r.price_usd),
+        num.clone(),
+        flash_tint(FG, flash),
+    );
+
+    x += O_CHG;
+    let (chg_text, chg_color) = match r.change_24h {
+        Some(c) => (market::pct_signed(c), if c < 0.0 { RED } else { UP }),
+        None => ("—".to_string(), FAINT),
+    };
+    p.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, chg_text, num, chg_color);
+
+    let spark_rect = egui::Rect::from_min_size(
+        egui::pos2(x + 12.0, rect.top() + 6.0),
+        egui::vec2(O_SPARK - 16.0, rect.height() - 12.0),
     );
     sparkline(p, spark_rect, &r.spark, chg_color);
 }
@@ -2187,7 +2746,12 @@ fn trending_header(ui: &mut egui::Ui) {
 /// Returns true when the row was clicked, which reads that token in the agent
 /// card above — the board is the list of things worth asking about, so pointing
 /// at one should be the whole gesture.
-fn trending_row(ui: &mut egui::Ui, i: usize, r: &trending::Row) -> bool {
+fn trending_row(
+    ui: &mut egui::Ui,
+    i: usize,
+    r: &trending::Row,
+    flash: Option<&(Instant, bool)>,
+) -> bool {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(T_TABLE_W, 26.0), egui::Sense::click());
     if !ui.is_rect_visible(rect) {
@@ -2231,7 +2795,7 @@ fn trending_row(ui: &mut egui::Ui, i: usize, r: &trending::Row) -> bool {
         egui::Align2::RIGHT_CENTER,
         market::money_price(r.price_usd),
         num.clone(),
-        FG,
+        flash_tint(FG, flash),
     );
 
     x += T_CHG;
@@ -2312,6 +2876,45 @@ fn sparkline(p: &egui::Painter, rect: egui::Rect, pts: &[f32], color: Color32) {
         })
         .collect();
     p.add(egui::Shape::line(points, egui::Stroke::new(1.4_f32, color)));
+}
+
+/// Diffs a table's previous snapshot against the one that just landed and
+/// records who moved, keyed by symbol — called once, right when a refresh
+/// arrives, rather than every frame. Entries older than `FLASH_DURATION` are
+/// dropped here too, so the map never grows past whatever changed in the
+/// last refresh or two.
+fn note_flashes<R>(
+    flash: &mut HashMap<String, (Instant, bool)>,
+    old: &[R],
+    new: &[R],
+    symbol: impl Fn(&R) -> &str,
+    price: impl Fn(&R) -> f64,
+) {
+    let prev: HashMap<&str, f64> = old.iter().map(|r| (symbol(r), price(r))).collect();
+    let now = Instant::now();
+    for r in new {
+        if let Some(&p) = prev.get(symbol(r)) {
+            let np = price(r);
+            if (np - p).abs() > f64::EPSILON {
+                flash.insert(symbol(r).to_string(), (now, np > p));
+            }
+        }
+    }
+    flash.retain(|_, (at, _)| at.elapsed() < FLASH_DURATION);
+}
+
+/// The flash colour for a row whose price just moved: full brightness the
+/// instant it changes, fading linearly back to `base` over `FLASH_DURATION`
+/// so the eye catches the change without the number staying tinted forever.
+fn flash_tint(base: Color32, flash: Option<&(Instant, bool)>) -> Color32 {
+    let Some((at, up)) = flash else { return base };
+    let mag = (1.0 - at.elapsed().as_secs_f32() / FLASH_DURATION.as_secs_f32()).clamp(0.0, 1.0);
+    let full = if *up { UP } else { RED };
+    Color32::from_rgb(
+        (base.r() as f32 + (full.r() as f32 - base.r() as f32) * mag) as u8,
+        (base.g() as f32 + (full.g() as f32 - base.g() as f32) * mag) as u8,
+        (base.b() as f32 + (full.b() as f32 - base.b() as f32) * mag) as u8,
+    )
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2406,7 +3009,7 @@ fn screen_card(ui: &mut egui::Ui, rows: &[trending::Row], take: &str, window: tr
 
     trending_header(ui);
     for (i, row) in rows.iter().enumerate() {
-        trending_row(ui, i, row);
+        trending_row(ui, i, row, None);
     }
 
     if !take.is_empty() {
@@ -2841,7 +3444,7 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
             ui.add_space(6.0);
             table_header(ui);
             for (i, row) in rows.iter().enumerate() {
-                market_row(ui, i, row);
+                market_row(ui, i, row, None);
             }
         }
         Outcome::Screen { rows, take, window } => screen_card(ui, rows, take, *window),
@@ -2906,6 +3509,28 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                 RichText::new(format!("out {}", quote.token_out.address))
                     .color(FAINT)
                     .font(FontId::monospace(11.0)),
+            );
+        }
+        Outcome::Stock { symbol, name, price_usd, change_24h } => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(symbol).color(FG).strong());
+                ui.label(RichText::new("Ondo Finance").color(DIM).small());
+            });
+            if let Some(n) = name {
+                ui.label(RichText::new(n).color(FAINT).small());
+            }
+            ui.label(
+                RichText::new(market::money_price(*price_usd))
+                    .color(ACCENT)
+                    .font(FontId::monospace(20.0)),
+            );
+            if let Some(c) = change_24h {
+                ui.label(RichText::new(market::pct_signed(*c)).color(if *c >= 0.0 { UP } else { RED }).small());
+            }
+            ui.label(
+                RichText::new("Reference price only — not tradable from this app yet.")
+                    .color(FAINT)
+                    .small(),
             );
         }
     }
