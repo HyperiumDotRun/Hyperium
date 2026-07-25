@@ -84,7 +84,14 @@ const EXAMPLES: &[Example] = &[
              price sits to either edge.",
         ),
     },
-    Example { text: "dividend yield of AAPL on Ondo", hint: None },
+    Example {
+        text: "dividend yield of AAPL on Ondo",
+        hint: Some(
+            "Ondo doesn't pay this out in cash here — it compounds into the token's \
+             own price instead, which is why the price drifts above the real \
+             stock's over time.",
+        ),
+    },
 ];
 
 /// Phrases cycled while a request is in flight. They name the step actually
