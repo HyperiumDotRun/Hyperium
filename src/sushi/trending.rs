@@ -155,6 +155,18 @@ impl Row {
         let total = self.buys_h1 + self.sells_h1;
         (total > 0).then(|| self.buys_h1 as f64 / total as f64)
     }
+
+    /// 24h volume against the pool's own liquidity — not a verdict, a fact:
+    /// a high number means the volume that moved today is large next to
+    /// what's actually sitting in the pool, so the same-size trade pushes
+    /// price further than it would in a deeper pool doing identical volume.
+    /// A fresh, thin, genuinely busy launch looks exactly like a high
+    /// number here too — this says "trades here move price a lot", not
+    /// "avoid this". `None` with no liquidity on record, where a ratio
+    /// would be a division artifact rather than a real read.
+    pub fn volume_to_liquidity(&self) -> Option<f64> {
+        (self.liquidity_usd > 0.0).then(|| self.volume_h24 / self.liquidity_usd)
+    }
 }
 
 /// True for Dexscreener's own spelling of Sushi's pools. Exact match, not a
@@ -647,6 +659,23 @@ mod tests {
         let raw = vec![p];
         let row = &rank(&raw, 10, Window::H24)[0];
         assert!(row.buy_pressure_h1().is_none());
+    }
+
+    #[test]
+    fn volume_to_liquidity_reads_24h_volume_against_the_pools_liquidity() {
+        // pair() sets liquidity.usd to a fixed 1000.0.
+        let raw = vec![pair("X", "0xx", 4000.0)];
+        let row = &rank(&raw, 10, Window::H24)[0];
+        assert!((row.volume_to_liquidity().unwrap() - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn volume_to_liquidity_is_none_with_no_liquidity_on_record() {
+        let mut p = pair("X", "0xx", 1000.0);
+        p["liquidity"]["usd"] = json!(0.0);
+        let raw = vec![p];
+        let row = &rank(&raw, 10, Window::H24)[0];
+        assert!(row.volume_to_liquidity().is_none());
     }
 
     #[test]

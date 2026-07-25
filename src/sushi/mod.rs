@@ -68,6 +68,11 @@ const THINKING: &[&str] =
 /// token and most of the tail is dust, so the board keeps the busy end.
 const TRENDING_ROWS: usize = 14;
 
+/// How many rows the Ondo tab's dashboard shows — the busy end of
+/// `ondo::screen`'s ranking, same "keep the busy end" idea as
+/// `TRENDING_ROWS`.
+const ONDO_DASHBOARD_ROWS: usize = 12;
+
 /// The brief for the chart read.
 ///
 /// Voice is degen on purpose — this is a shitcoin board, and a stiff analyst
@@ -846,15 +851,20 @@ fn agent_tools() -> Vec<crate::llm::ToolSpec> {
             description: "Scans Robinhood Chain and ranks it by how unusual the LAST HOUR's \
                 activity is, not by raw volume like screen_chain — this is the tool for \
                 \"what's heating up\", \"more volume than usual\", \"anything unusual right \
-                now\" on this chain. Each row carries two numbers, both computed in Rust, \
-                never estimate either yourself: a heat ratio (last hour's volume against that \
-                token's own flat 24h pace — 1.0x is normal, 3.0x is running 3x its usual hourly \
-                rate) and a buy-pressure percentage for the last hour (share of trades that \
-                were buys, not sells — 50% is neutral). A token with almost no volume is \
-                excluded first so the ratio isn't just noise from a near-empty pool. Someone \
-                asking \"what's heating up\" wants the handful that actually are, not a long \
-                list — keep limit small. Use screen_chain instead for \"what's busiest\" or \
-                \"what just launched\" — those are about raw activity, not unusualness.",
+                now\" on this chain. Each row carries three numbers, all computed in Rust, \
+                never estimate any of them yourself: a heat ratio (last hour's volume against \
+                that token's own flat 24h pace — 1.0x is normal, 3.0x is running 3x its usual \
+                hourly rate), a buy-pressure percentage for the last hour (share of trades that \
+                were buys, not sells — 50% is neutral), and a volume/liquidity ratio (24h \
+                volume against the pool's own liquidity — a high number, roughly 3x or more, \
+                means trades in that pool move price more per dollar than a deeper pool doing \
+                the same volume; it's a fact about the pool's depth, not a verdict on the \
+                token — never phrase it as risky/unsafe, just describe the number). A token \
+                with almost no volume is excluded first so the ratios aren't just noise from a \
+                near-empty pool. Someone asking \"what's heating up\" wants the handful that \
+                actually are, not a long list — keep limit small. Use screen_chain instead for \
+                \"what's busiest\" or \"what just launched\" — those are about raw activity, \
+                not unusualness.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1055,7 +1065,10 @@ fn tool_result_text(outcome: &Outcome) -> String {
             let mut out = String::from(
                 "Robinhood Chain, ranked by the last hour's volume against its own flat daily \
                  pace (1.0x = normal). Also shown: buy pressure over the last hour (share of \
-                 trades that were buys, not sells):\n",
+                 trades that were buys, not sells), and 24h volume against the pool's own \
+                 liquidity (a high number means trades here move price more per dollar than a \
+                 deeper pool doing the same volume — a fact about the pool, not a verdict on \
+                 the token):\n",
             );
             for r in rows {
                 let heat = r
@@ -1066,8 +1079,12 @@ fn tool_result_text(outcome: &Outcome) -> String {
                     .buy_pressure_h1()
                     .map(|p| format!("{:.0}% buys", p * 100.0))
                     .unwrap_or_else(|| "no trades this hour".to_string());
+                let vol_liq = r
+                    .volume_to_liquidity()
+                    .map(|x| format!("{x:.1}x volume/liquidity"))
+                    .unwrap_or_else(|| "no liquidity reading".to_string());
                 out.push_str(&format!(
-                    "- {} · {} · {heat} · {pressure}\n",
+                    "- {} · {} · {heat} · {pressure} · {vol_liq}\n",
                     r.symbol,
                     market::money_price(r.price_usd),
                 ));
@@ -1512,14 +1529,20 @@ impl SushiTool {
     }
 
     /// No key required — `ondo::market` falls through to Hyperium's shared
-    /// proxy for a blank key, which is what every row here passes.
+    /// proxy for a blank key, which is what every row here passes. The
+    /// dashboard shows the busy end of `ondo::screen`'s ranking — whatever's
+    /// actually moving right now across all of Ondo's assets — rather than a
+    /// fixed roster, so it isn't the same ten mega-caps on a quiet day for
+    /// them and a busy one somewhere else.
     fn refresh_ondo(&mut self, ctx: &egui::Context) {
         if self.ondo_rx.is_some() {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(ondo::dashboard(ondo::DASHBOARD_TICKERS));
+            let mut rows = ondo::screen();
+            rows.truncate(ONDO_DASHBOARD_ROWS);
+            let _ = tx.send(rows);
         });
         self.ondo_rx = Some(rx);
         ctx.request_repaint();
@@ -2059,13 +2082,14 @@ impl SushiTool {
     }
 
     /// Ondo Stocks — reference prices only (see `ondo.rs`): no swap card,
-    /// no click-through, just what the fixed watchlist is doing right now.
+    /// click a row to look it up. The rows themselves are the busy end of
+    /// `ondo::screen`'s ranking, not a fixed list — see `refresh_ondo`.
     fn ondo_section(&mut self, ui: &mut egui::Ui) {
         let loading = self.ondo_rx.is_some();
 
         ui.horizontal(|ui| {
             ui.label(RichText::new("ONDO STOCKS").color(ACCENT).small().strong());
-            ui.label(RichText::new("tokenized US equities · reference only").color(FAINT).small());
+            ui.label(RichText::new("most active right now · reference only").color(FAINT).small());
             if loading {
                 ui.add(egui::Spinner::new().size(13.0).color(ACCENT));
             } else if let Some(at) = self.ondo_at {
@@ -2079,10 +2103,11 @@ impl SushiTool {
         ui.add_space(2.0);
         ui.label(
             RichText::new(
-                "TSLAon, AAPLon and the rest of Ondo's on-chain stock trackers — read through \
-                 Hyperium's own shared key, so this works with no Ondo API key of your own. \
-                 Prices drift slightly above the real stock over time (dividends compound in \
-                 rather than pay out); nothing here is tradable from this app yet.",
+                "The busiest of Ondo's on-chain stock trackers right now, ranked by today's \
+                 volume against each one's own average — read through Hyperium's own shared \
+                 key, so this works with no Ondo API key of your own. Prices drift slightly \
+                 above the real stock over time (dividends compound in rather than pay out); \
+                 nothing here is tradable from this app yet.",
             )
             .color(DIM)
             .small(),
@@ -3903,6 +3928,13 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                         ui.label(
                             RichText::new(format!("{:.0}% buys", p * 100.0))
                                 .color(if p >= 0.5 { UP } else { RED })
+                                .small(),
+                        );
+                    }
+                    if let Some(vl) = r.volume_to_liquidity() {
+                        ui.label(
+                            RichText::new(format!("{vl:.1}x vol/liq"))
+                                .color(if vl >= 3.0 { ORANGE } else { FAINT })
                                 .small(),
                         );
                     }
