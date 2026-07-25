@@ -31,7 +31,7 @@ pub trait Tool {
 
 pub const BUILTIN: &[(&str, &str)] = &[
     ("genai", "Mirage"),
-    ("sushi", "Sushi agent"),
+    ("sushi", "AI Agent"),
     ("memory", "Memory"),
     ("cheats", "Command memo"),
     ("health", "Health log"),

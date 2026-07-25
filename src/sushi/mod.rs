@@ -91,6 +91,23 @@ Cite the actual figures you are reading. Personality doesn't excuse making numbe
 Never tell anyone to buy or sell this or any other token, never say a price will go up \
 or down, never call anything safe. You can roast a chart; you cannot recommend one.";
 
+/// Same hard line as `TAKE_SYSTEM` (no buy/sell calls, no "safe"), a
+/// different voice — Ondo Stocks are real equities, reference-only in this
+/// app, not a degen chain board, so this stays plain rather than performing
+/// the same "unhinged crypto-twitter" bit that would be tone-deaf here.
+const STOCK_TAKE_SYSTEM: &str = "\
+You are reading one Ondo Finance tokenized-stock's reference data — a real US equity \
+traded on-chain, not a crypto/degen token. Talk plainly, like someone glancing at a \
+stock quote, not a research desk and not crypto-twitter.
+
+Reply with one or two short sentences reacting to what the numbers show: whether \
+today's volume is running above or below its own average, and — if given — where the \
+price sits in its 52-week range. Cite the actual figures you are reading.
+
+Never tell anyone to buy or sell this or any other stock, never say a price will go up \
+or down, never call anything safe. This is reference data only — say so if it's not \
+already obvious from context — this app can't trade it.";
+
 /// Same voice and the same hard line as `TAKE_SYSTEM`, aimed at a list
 /// instead of one token — this is the one place in the whole tool that could
 /// most easily slide into "buy this one", so the rule is repeated rather than
@@ -282,9 +299,22 @@ enum Outcome {
     /// A reference read from Ondo Finance's tokenized-stocks API — a
     /// *different* chain and product from everything else in this file
     /// (Ondo Stocks live on Ethereum/BNB/Solana, not Robinhood Chain).
-    /// Informational only: there is no swap card, no mint/redeem, nothing to
-    /// click here yet — see `ondo.rs`.
-    Stock { symbol: String, name: Option<String>, price_usd: f64, change_24h: Option<f64> },
+    /// Informational only: there is no swap card, no mint/redeem — see
+    /// `ondo.rs`. Reachable by clicking a symbol in the Ondo tab's tables,
+    /// same as `Token` is on the Robinhood side.
+    Stock {
+        symbol: String,
+        name: Option<String>,
+        price_usd: f64,
+        change_24h: Option<f64>,
+        /// Same-day closes, straight from `ondo::Market` — carried through so
+        /// the single-ticker card can draw the same sparkline the watchlist
+        /// rows do, instead of a lookup answering with less than a screen.
+        spark: Vec<f32>,
+        /// The model's short read on this one stock (`STOCK_TAKE_SYSTEM`),
+        /// empty with no AI key configured — same shape as `Token`'s `take`.
+        take: String,
+    },
     /// The Ondo watchlist ranked by `volume_ratio` — answers "which of these
     /// is trading more than usual", the kind of screening question a single
     /// `lookup_stock` call can't (it only ever sees one symbol at a time).
@@ -403,10 +433,9 @@ fn chat_reply(outcome: &Outcome) -> String {
             ),
             None => "Nothing came back for that.".to_string(),
         },
-        Outcome::Token { .. } | Outcome::Screen { .. } => String::new(),
-        Outcome::Stock { symbol, price_usd, .. } => {
-            format!("{symbol} is at {} on Ondo (reference price, not tradable here).", market::money_price(*price_usd))
-        }
+        // `Stock` carries its own `take` the same way `Token` does — shown
+        // inside the card itself, not duplicated as a written line above it.
+        Outcome::Token { .. } | Outcome::Screen { .. } | Outcome::Stock { .. } => String::new(),
         // Sorted by `ondo::screen` already, so the first entry with a usable
         // ratio is the whole answer — same "top of a ranked list" shape as
         // `Outcome::Market` above.
@@ -741,11 +770,31 @@ fn run(intent: Intent, api_key: &str, ai_key: &str, ondo_key: &str) -> Result<Ou
         }
         Intent::StockLookup { ticker } => {
             let m = ondo::market(&ticker, ondo_key)?;
+            let take = if ai_key.trim().is_empty() {
+                String::new()
+            } else {
+                use crate::llm::LlmProvider;
+                let brief = format!(
+                    "{} ({}) = {}{}{}",
+                    m.symbol,
+                    m.name.as_deref().unwrap_or("Ondo Stock"),
+                    market::money_price(m.price_usd),
+                    m.change_24h.map(|c| format!(", 24h {c:+.2}%")).unwrap_or_default(),
+                    m.volume_ratio()
+                        .map(|r| format!(", volume {r:.2}x its own average today"))
+                        .unwrap_or_default(),
+                );
+                crate::llm::Anthropic::new(ai_key.to_string())
+                    .complete(STOCK_TAKE_SYSTEM, &brief)
+                    .unwrap_or_else(|e| format!("(no read: {e})"))
+            };
             Ok(Outcome::Stock {
                 symbol: m.symbol,
                 name: m.name,
                 price_usd: m.price_usd,
                 change_24h: m.change_24h,
+                spark: m.spark,
+                take,
             })
         }
     }
@@ -801,14 +850,15 @@ fn agent_tools() -> Vec<crate::llm::ToolSpec> {
                 never estimate either yourself: a heat ratio (last hour's volume against that \
                 token's own flat 24h pace — 1.0x is normal, 3.0x is running 3x its usual hourly \
                 rate) and a buy-pressure percentage for the last hour (share of trades that \
-                were buys, not sells — 50% is neutral). Takes no arguments beyond an optional \
-                limit; a token with almost no volume is excluded first so the ratio isn't just \
-                noise from a near-empty pool. Use screen_chain instead for \"what's busiest\" \
-                or \"what just launched\" — those are about raw activity, not unusualness.",
+                were buys, not sells — 50% is neutral). A token with almost no volume is \
+                excluded first so the ratio isn't just noise from a near-empty pool. Someone \
+                asking \"what's heating up\" wants the handful that actually are, not a long \
+                list — keep limit small. Use screen_chain instead for \"what's busiest\" or \
+                \"what just launched\" — those are about raw activity, not unusualness.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "limit": { "type": "integer", "description": "default 15, max 30" }
+                    "limit": { "type": "integer", "description": "default 8, max 15 — how many ranked rows to return" }
                 }
             }),
         },
@@ -883,10 +933,16 @@ fn agent_tools() -> Vec<crate::llm::ToolSpec> {
                 a whole rather than one ticker. A ratio of 1.0 is normal; 2.0 means twice the \
                 usual volume today. Do the comparison by reading the ratios this tool returns \
                 — never estimate \"usual\" volume yourself, it's a real trailing average from \
-                Ondo, not something to guess at. Takes no arguments; it always scans \
-                everything. Use lookup_stock instead once you already know which one ticker \
-                someone wants.",
-            input_schema: json!({ "type": "object", "properties": {} }),
+                Ondo, not something to guess at. Scans everything internally but only returns \
+                the top of the ranking (see limit) — someone asking \"what's unusual\" wants \
+                the handful that actually are, not all several hundred. Use lookup_stock \
+                instead once you already know which one ticker someone wants.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "description": "default 8, max 15 — how many ranked rows to return" }
+                }
+            }),
         },
         crate::llm::ToolSpec {
             name: "execute_swap",
@@ -957,7 +1013,7 @@ fn tool_result_text(outcome: &Outcome) -> String {
             )
         }
         Outcome::Chat { reply, .. } => reply.clone(),
-        Outcome::Stock { symbol, name, price_usd, change_24h } => {
+        Outcome::Stock { symbol, name, price_usd, change_24h, .. } => {
             let chg = change_24h.map(|c| format!(", 24h {c:+.2}%")).unwrap_or_default();
             match name {
                 Some(n) => format!(
@@ -1223,7 +1279,7 @@ fn dispatch_tool(
             run(Intent::ChainScreen { limit, window }, api_key, "", "")
         }
         "chain_screen" => {
-            let limit = input["limit"].as_u64().unwrap_or(15).clamp(1, intent::SCREEN_LIMIT_MAX as u64) as usize;
+            let limit = input["limit"].as_u64().unwrap_or(8).clamp(1, 15) as usize;
             trending::screen_heat(limit).map(|rows| Outcome::ChainHeat { rows })
         }
         "lookup_token" => {
@@ -1248,7 +1304,12 @@ fn dispatch_tool(
                 run(Intent::StockLookup { ticker }, "", "", ondo_key)
             }
         }
-        "ondo_screen" => Ok(Outcome::StockScreen { rows: ondo::screen() }),
+        "ondo_screen" => {
+            let limit = input["limit"].as_u64().unwrap_or(8).clamp(1, 15) as usize;
+            let mut rows = ondo::screen();
+            rows.truncate(limit);
+            Ok(Outcome::StockScreen { rows })
+        }
         other => Err(format!("unknown tool {other}")),
     };
     match result {
@@ -2042,10 +2103,52 @@ impl SushiTool {
         }
 
         ondo_header(ui);
+        let mut picked = None;
         for (i, row) in self.ondo.iter().enumerate() {
             let flash = self.ondo_flash.get(&row.symbol);
-            ondo_row(ui, i, row, flash);
+            if ondo_row(ui, i, row, flash) {
+                picked = Some(row.symbol.clone());
+            }
         }
+        if let Some(sym) = picked {
+            let ctx = ui.ctx().clone();
+            self.look_up_stock(&ctx, sym);
+        }
+    }
+
+    /// Ondo's own lookup path — same shape as `look_up`, but for
+    /// `StockLookup` rather than `TokenLookup`, and reachable by clicking a
+    /// symbol in either Ondo table (`ondo_section`, `ondo_row`) instead of
+    /// typing a ticker. Runs with a real AI key when one's configured, same
+    /// as `look_up`, so clicking a name gets a real one-line take, not a
+    /// bare number.
+    fn look_up_stock(&mut self, ctx: &egui::Context, ticker: String) {
+        let ai_key = self.ai_key.clone();
+        let ondo_key = self.ondo_key.clone();
+        let label = format!("${ticker} (Ondo)");
+        self.spawn(ctx, label, move || {
+            run(Intent::StockLookup { ticker }, "", &ai_key, &ondo_key)
+        });
+    }
+
+    /// The last turn's card, if it was a stock lookup — same "reuse the
+    /// chat turn, skip the bubble" idea as `robinhood_card`, just without
+    /// any wallet/swap state to thread through since there's nothing
+    /// interactive on an Ondo card.
+    fn ondo_card(&mut self, ui: &mut egui::Ui) {
+        if self.rx.is_some() {
+            ui.horizontal(|ui| thinking_line(ui, self.busy_since, ui.input(|i| i.time)));
+            return;
+        }
+        let Some(turn) = self.chat.last() else { return };
+        let ChatAnswer::Result(outcome) = &turn.answer else { return };
+        let Some(stock) = as_stock_outcome(outcome) else { return };
+        egui::Frame::NONE
+            .fill(BG_ELEVATED)
+            .corner_radius(12.0)
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| result_card_inner(ui, stock));
+        ui.add_space(14.0);
     }
 }
 
@@ -2143,6 +2246,7 @@ impl Tool for SushiTool {
             }
             Tab::Ondo => {
                 egui::ScrollArea::vertical().id_salt("ondo_scroll").show(ui, |ui| {
+                    self.ondo_card(ui);
                     self.ondo_section(ui);
                 });
             }
@@ -2762,10 +2866,16 @@ fn ondo_header(ui: &mut egui::Ui) {
     p.text(egui::pos2(x, cy), egui::Align2::LEFT_CENTER, "TODAY", f, FAINT);
 }
 
-fn ondo_row(ui: &mut egui::Ui, i: usize, r: &ondo::Market, flash: Option<&(Instant, bool)>) {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(O_TABLE_W, 26.0), egui::Sense::hover());
+/// Returns true when the row was clicked — same gesture as `trending_row`:
+/// a symbol is the thing worth asking about, so pointing at one should be
+/// the whole gesture, not a separate button hunted for elsewhere.
+fn ondo_row(ui: &mut egui::Ui, i: usize, r: &ondo::Market, flash: Option<&(Instant, bool)>) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(O_TABLE_W, 26.0), egui::Sense::click());
     if !ui.is_rect_visible(rect) {
-        return;
+        return false;
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let p = ui.painter();
     if resp.hovered() {
@@ -2818,6 +2928,7 @@ fn ondo_row(ui: &mut egui::Ui, i: usize, r: &ondo::Market, flash: Option<&(Insta
         egui::vec2(O_SPARK - 16.0, rect.height() - 12.0),
     );
     sparkline(p, spark_rect, &r.spark, chg_color);
+    resp.clicked()
 }
 
 /// One ticker, one price. Sized so a row of them wraps into an even grid at the
@@ -3020,6 +3131,19 @@ fn sparkline(p: &egui::Painter, rect: egui::Rect, pts: &[f32], color: Color32) {
     p.add(egui::Shape::line(points, egui::Stroke::new(1.4_f32, color)));
 }
 
+/// `sparkline`, but for a chat card rather than a table row: allocates its
+/// own space in the current layout instead of being handed a rect a caller
+/// already carved out of a fixed-width table. Same "no axes, no labels, \
+/// shape only" idea, just reachable from `result_card_inner` where there is
+/// no table to sit inside.
+fn chart_widget(ui: &mut egui::Ui, spark: &[f32], color: Color32, size: egui::Vec2) {
+    if spark.len() < 2 {
+        return;
+    }
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    sparkline(ui.painter(), rect, spark, color);
+}
+
 /// Diffs a table's previous snapshot against the one that just landed and
 /// records who moved, keyed by symbol — called once, right when a refresh
 /// arrives, rather than every frame. Entries older than `FLASH_DURATION` are
@@ -3194,6 +3318,17 @@ fn as_token(outcome: &Outcome) -> Option<&trending::Info> {
     match outcome {
         Outcome::Token { info, .. } => Some(info),
         Outcome::Chat { card: Some(inner), .. } => as_token(inner),
+        _ => None,
+    }
+}
+
+/// Same idea as `as_token`, for `ondo_card` — returns the `Outcome` itself
+/// rather than unpacking it, since `result_card_inner` (unlike `token_card`)
+/// takes the whole `Outcome` and needs no extra wallet/swap state alongside it.
+fn as_stock_outcome(outcome: &Outcome) -> Option<&Outcome> {
+    match outcome {
+        Outcome::Stock { .. } => Some(outcome),
+        Outcome::Chat { card: Some(inner), .. } => as_stock_outcome(inner),
         _ => None,
     }
 }
@@ -3653,7 +3788,7 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                     .font(FontId::monospace(11.0)),
             );
         }
-        Outcome::Stock { symbol, name, price_usd, change_24h } => {
+        Outcome::Stock { symbol, name, price_usd, change_24h, spark, take } => {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(symbol).color(FG).strong());
                 ui.label(RichText::new("Ondo Finance").color(DIM).small());
@@ -3666,9 +3801,22 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                     .color(ACCENT)
                     .font(FontId::monospace(20.0)),
             );
-            if let Some(c) = change_24h {
-                ui.label(RichText::new(market::pct_signed(*c)).color(if *c >= 0.0 { UP } else { RED }).small());
+            let chg_color = match change_24h {
+                Some(c) => {
+                    ui.label(RichText::new(market::pct_signed(*c)).color(if *c >= 0.0 { UP } else { RED }).small());
+                    if *c >= 0.0 { UP } else { RED }
+                }
+                None => ACCENT,
+            };
+            if spark.len() >= 2 {
+                ui.add_space(4.0);
+                chart_widget(ui, spark, chg_color, egui::vec2(260.0, 56.0));
             }
+            if !take.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new(take).color(FG));
+            }
+            ui.add_space(4.0);
             ui.label(
                 RichText::new("Reference price only — not tradable from this app yet.")
                     .color(FAINT)
@@ -3708,6 +3856,9 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                                 .color(if p >= 0.9 || p <= 0.1 { ORANGE } else { FAINT })
                                 .small(),
                         );
+                    }
+                    if r.spark.len() >= 2 {
+                        chart_widget(ui, &r.spark, color, egui::vec2(64.0, 18.0));
                     }
                 });
             }

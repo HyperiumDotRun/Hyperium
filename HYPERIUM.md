@@ -37,14 +37,14 @@ icon, short video) instead of a placeholder or an external image. The Hyperium b
 exposes a headless mode:
 
 ```
-"C:\Users\tomch\Desktop\Hyperium\target\release\hyperium.exe" gen-image --model gpt-image-2 --aspect 16:9 --res 2K --out ./assets "a prompt"
-"C:\Users\tomch\Desktop\Hyperium\target\release\hyperium.exe" gen-video --model seedance-2 --aspect 16:9 --dur 5 --out ./assets "a prompt"
+"C:\Users\tomch\Desktop\Hyperium\target\debug\hyperium.exe" gen-image --model gpt-image-2 --aspect 16:9 --res 2K --out ./assets "a prompt"
+"C:\Users\tomch\Desktop\Hyperium\target\debug\hyperium.exe" gen-video --model seedance-2 --aspect 16:9 --dur 5 --out ./assets "a prompt"
 ```
 
 - The **generated file path is printed to stdout**: capture it and reference it in your code
   (HTML/CSS/etc.).
 - Pick the `--aspect` that fits the placement (wide hero = `16:9`, portrait = `9:16`, square
-  = `1:1`...). Exact per-model values: `"C:\Users\tomch\Desktop\Hyperium\target\release\hyperium.exe" gen-image --list`.
+  = `1:1`...). Exact per-model values: `"C:\Users\tomch\Desktop\Hyperium\target\debug\hyperium.exe" gen-image --list`.
 - Available models:
   - **GPT Image 2** (OpenAI, image): `--model gpt-image-2`
   - **Nano Banana Pro** (Google, image): `--model nano-banana-pro`
