@@ -84,6 +84,7 @@ const EXAMPLES: &[Example] = &[
              price sits to either edge.",
         ),
     },
+    Example { text: "dividend yield of AAPL on Ondo", hint: None },
 ];
 
 /// Phrases cycled while a request is in flight. They name the step actually
@@ -1984,7 +1985,29 @@ impl SushiTool {
                     // still refreshes on its own; asking through chat no
                     // longer reaches into it.
                     match outcome {
-                        Ok(o) => self.chat.push(ChatTurn { question, answer: ChatAnswer::Result(o) }),
+                        Ok(o) => {
+                            // `ask_model` (the free-text path) keeps
+                            // `agent_messages` current itself, inside
+                            // `converse`. A click-through lookup
+                            // (`look_up`/`look_up_stock` — a ticker box or a
+                            // table row, no model call involved) never
+                            // touches it at all, so without this a follow-up
+                            // typed right after clicking a row — "what do
+                            // you think about it" — lands with no memory of
+                            // what "it" was. Not every outcome needs an AI
+                            // read of its own to still be worth remembering.
+                            if !matches!(o, Outcome::Chat { .. }) {
+                                let text = tool_result_text(&o);
+                                let mut guard = self.agent_messages.lock().unwrap();
+                                guard.push(
+                                    serde_json::json!({ "role": "user", "content": question.clone() }),
+                                );
+                                guard.push(
+                                    serde_json::json!({ "role": "assistant", "content": text }),
+                                );
+                            }
+                            self.chat.push(ChatTurn { question, answer: ChatAnswer::Result(o) });
+                        }
                         Err(e) => self.chat.push(ChatTurn { question, answer: ChatAnswer::Error(e) }),
                     }
                     self.rx = None;
