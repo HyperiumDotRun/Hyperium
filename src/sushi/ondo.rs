@@ -59,6 +59,16 @@ fn get_proxy(symbol: &str) -> Result<Value, String> {
     read_response(resp)
 }
 
+/// The proxy's `/market-all` route, one call for Ondo's whole supported-asset
+/// list (upstream `GET /v1/assets/all/market`) — what `screen` uses instead
+/// of fanning out one request per symbol, so coverage isn't capped at
+/// whatever's in `DASHBOARD_TICKERS`.
+fn get_proxy_all() -> Result<Value, String> {
+    let url = format!("{PROXY_BASE}/market-all");
+    let resp = agent().get(&url).call();
+    read_response(resp)
+}
+
 fn read_response(resp: Result<ureq::Response, ureq::Error>) -> Result<Value, String> {
     match resp {
         Ok(r) => r.into_json().map_err(|e| format!("bad response: {e}")),
@@ -91,6 +101,46 @@ pub struct Market {
     /// (accumulating would mean every symbol starts as a flat line on launch
     /// and only grows a shape after sitting open for a while).
     pub spark: Vec<f32>,
+    /// Today's volume on the real, underlying stock (shares), and Ondo's own
+    /// trailing average for it — both straight off `underlyingMarket`, not
+    /// derived. This is what answers "is this trading more than usual
+    /// today", not `primaryMarket`'s on-chain-token numbers, which are a
+    /// much thinner market than the stock itself.
+    pub volume: Option<f64>,
+    pub avg_volume: Option<f64>,
+    /// The real stock's 52-week high/low, straight off `underlyingMarket` —
+    /// what `range_position` uses to say how close today's price sits to
+    /// either edge, without this module ever having to track a year of
+    /// history itself.
+    pub price_high_52w: Option<f64>,
+    pub price_low_52w: Option<f64>,
+}
+
+impl Market {
+    /// >1.0 means today is running hotter than usual, <1.0 quieter. `None`
+    /// when either side is missing or the average is zero — a ratio against
+    /// a zero baseline is not a real "how unusual is this", it's a division
+    /// artifact.
+    pub fn volume_ratio(&self) -> Option<f64> {
+        match (self.volume, self.avg_volume) {
+            (Some(v), Some(a)) if a > 0.0 => Some(v / a),
+            _ => None,
+        }
+    }
+
+    /// Where today's price sits in the 52-week range: 0.0 at the 52w low,
+    /// 1.0 at the 52w high. A classic screener read (near-highs/near-lows),
+    /// and a real one here — Ondo hands back both edges itself, this isn't
+    /// reconstructed from a shorter window standing in for a year. `None`
+    /// when either edge is missing or the range is degenerate (high <= low).
+    pub fn range_position(&self) -> Option<f64> {
+        match (self.price_high_52w, self.price_low_52w) {
+            (Some(high), Some(low)) if high > low => {
+                Some(((self.price_usd - low) / (high - low)).clamp(0.0, 1.0))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Normalizes a bare ticker (`TSLA`) to Ondo's symbol convention — minimum 3
@@ -115,17 +165,65 @@ pub fn market(ticker: &str, api_key: &str) -> Result<Market, String> {
     parse_market(&symbol, &v)
 }
 
-/// One request per symbol run across a scoped thread pool — Ondo has no bulk
-/// endpoint, and the proxy's per-symbol edge cache means fanning these out is
-/// cheap rather than something to be saved up and batched. A single symbol's
-/// failure (a delisted/typo'd ticker) is dropped rather than failing the
-/// whole dashboard — one bad row shouldn't blank the other nine.
+/// One request per symbol run across a scoped thread pool — used for the
+/// small, fixed dashboard watchlist, where a per-symbol request each staying
+/// cheap and independently edge-cached matters more than round-trip count.
+/// `screen` below uses the real bulk endpoint instead; this stays for the
+/// UI's own Ondo tab, which deliberately shows a short curated list rather
+/// than the whole exchange. A single symbol's failure (a delisted/typo'd
+/// ticker) is dropped rather than failing the whole dashboard — one bad row
+/// shouldn't blank the other nine.
 pub fn dashboard(tickers: &[&str]) -> Vec<Market> {
     std::thread::scope(|scope| {
         let handles: Vec<_> =
             tickers.iter().map(|t| scope.spawn(move || market(t, ""))).collect();
         handles.into_iter().filter_map(|h| h.join().ok()?.ok()).collect()
     })
+}
+
+/// Every Ondo Stocks asset Ondo itself supports (`GET /v1/assets/all/market`,
+/// one call, via the proxy's `/market-all` route) — real coverage of the
+/// whole exchange rather than whatever's hardcoded in `DASHBOARD_TICKERS`.
+/// Symbol comes off each element's own `primaryMarket.symbol`, not a ticker
+/// this function already knew to ask for, since there's no per-symbol
+/// request here to remember one.
+pub fn all_markets() -> Result<Vec<Market>, String> {
+    let v = get_proxy_all()?;
+    let arr = v.as_array().ok_or("unexpected response shape from /market-all")?;
+    Ok(arr
+        .iter()
+        .filter_map(|elem| {
+            let symbol = elem["primaryMarket"]["symbol"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| elem["underlyingMarket"]["ticker"].as_str().map(|t| format!("{t}on")))?;
+            parse_market(&symbol, elem).ok()
+        })
+        .collect())
+}
+
+/// Ranked by `volume_ratio`, highest (most unusual) first, rows with no
+/// ratio pushed to the bottom rather than dropped, so "nothing looks unusual
+/// today" is still a real, inspectable answer rather than an empty list that
+/// reads like a failed call. Tries the real bulk endpoint first (the whole
+/// exchange); if that fails — proxy not yet updated, a network hiccup — falls
+/// back to fanning out over the small curated watchlist rather than handing
+/// back nothing. Sorting happens here rather than being left to the caller
+/// (or the model) for the same reason `market::fetch`'s Gainers/Losers sort
+/// happens in Rust: a ranking is arithmetic, not something to hand an LLM a
+/// pile of numbers and trust it to get right.
+pub fn screen() -> Vec<Market> {
+    let mut rows = all_markets().unwrap_or_default();
+    if rows.is_empty() {
+        rows = dashboard(DASHBOARD_TICKERS);
+    }
+    rows.sort_by(|a, b| {
+        b.volume_ratio()
+            .unwrap_or(f64::NEG_INFINITY)
+            .partial_cmp(&a.volume_ratio().unwrap_or(f64::NEG_INFINITY))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rows
 }
 
 /// A number that may have arrived as a JSON number or — as Ondo's real
@@ -165,7 +263,26 @@ fn parse_market(symbol: &str, v: &Value) -> Result<Market, String> {
         .map(|a| a.iter().filter_map(|p| num(&p["price"])).map(|p| p as f32).collect())
         .unwrap_or_default();
 
-    Ok(Market { symbol: symbol.to_uppercase(), name, price_usd, change_24h, spark })
+    // The stock's own volume, not the on-chain token's — `underlyingMarket`
+    // only, deliberately no fallback to a flatter/older shape: unlike price,
+    // getting this one wrong silently (e.g. reading a thin on-chain number
+    // as if it were the real market's) would make `screen`'s ranking lie.
+    let volume = num(&v["underlyingMarket"]["volume"]);
+    let avg_volume = num(&v["underlyingMarket"]["averageVolume"]);
+    let price_high_52w = num(&v["underlyingMarket"]["priceHigh52w"]);
+    let price_low_52w = num(&v["underlyingMarket"]["priceLow52w"]);
+
+    Ok(Market {
+        symbol: symbol.to_uppercase(),
+        name,
+        price_usd,
+        change_24h,
+        spark,
+        volume,
+        avg_volume,
+        price_high_52w,
+        price_low_52w,
+    })
 }
 
 #[cfg(test)]
@@ -213,7 +330,14 @@ mod tests {
                         {"timestamp": 2, "price": "311.340909"}
                     ]
                 },
-                "underlyingMarket": {"ticker": "TSLA", "name": "Tesla, Inc. Common Stock"}
+                "underlyingMarket": {
+                    "ticker": "TSLA",
+                    "name": "Tesla, Inc. Common Stock",
+                    "volume": "62760007.674769",
+                    "averageVolume": "69157673",
+                    "priceHigh52w": "498.83",
+                    "priceLow52w": "297.82"
+                }
             }"#,
         )
         .unwrap();
@@ -223,6 +347,84 @@ mod tests {
         assert!((m.change_24h.unwrap() - (-3.940670236142447777)).abs() < 1e-6);
         assert_eq!(m.name.as_deref(), Some("Tesla, Inc. Common Stock"));
         assert_eq!(m.spark, vec![324.113139_f32, 311.340909_f32]);
+        assert!((m.volume.unwrap() - 62_760_007.674769).abs() < 1e-3);
+        assert!((m.avg_volume.unwrap() - 69_157_673.0).abs() < 1e-3);
+        assert!((m.price_high_52w.unwrap() - 498.83).abs() < 1e-6);
+        assert!((m.price_low_52w.unwrap() - 297.82).abs() < 1e-6);
+        // (311.345 - 297.82) / (498.83 - 297.82) — real Tesla numbers, not a
+        // round one, which is exactly why it's worth pinning down.
+        assert!((m.range_position().unwrap() - 0.06728520969106032).abs() < 1e-6);
+        assert!((m.volume_ratio().unwrap() - 0.9074916050858015).abs() < 1e-6);
+    }
+
+    #[test]
+    fn volume_ratio_is_none_without_both_sides() {
+        let v: Value = serde_json::from_str(r#"{"price": 100.0}"#).unwrap();
+        let m = parse_market("XON", &v).unwrap();
+        assert!(m.volume.is_none());
+        assert!(m.volume_ratio().is_none());
+    }
+
+    fn mkt(symbol: &str, volume: Option<f64>, avg_volume: Option<f64>) -> Market {
+        Market {
+            symbol: symbol.into(),
+            name: None,
+            price_usd: 1.0,
+            change_24h: None,
+            spark: vec![],
+            volume,
+            avg_volume,
+            price_high_52w: None,
+            price_low_52w: None,
+        }
+    }
+
+    #[test]
+    fn screen_ranks_by_volume_ratio_highest_first() {
+        let hot = mkt("HOT", Some(300.0), Some(100.0));
+        let normal = mkt("NORM", Some(100.0), Some(100.0));
+        let unknown = mkt("UNK", None, None);
+        let mut rows = vec![normal, unknown, hot];
+        rows.sort_by(|a, b| {
+            b.volume_ratio()
+                .unwrap_or(f64::NEG_INFINITY)
+                .partial_cmp(&a.volume_ratio().unwrap_or(f64::NEG_INFINITY))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let order: Vec<&str> = rows.iter().map(|m| m.symbol.as_str()).collect();
+        assert_eq!(order, vec!["HOT", "NORM", "UNK"]);
+    }
+
+    #[test]
+    fn range_position_reads_where_price_sits_in_the_52w_band() {
+        let mut m = mkt("X", None, None);
+        m.price_usd = 75.0;
+        m.price_low_52w = Some(50.0);
+        m.price_high_52w = Some(100.0);
+        assert!((m.range_position().unwrap() - 0.5).abs() < 1e-9);
+
+        m.price_usd = 100.0;
+        assert!((m.range_position().unwrap() - 1.0).abs() < 1e-9);
+
+        m.price_usd = 50.0;
+        assert!((m.range_position().unwrap() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn range_position_clamps_a_price_that_has_moved_past_the_52w_edge() {
+        // The 52w figures update slower than the live price — a fresh
+        // breakout can sit above the recorded high for a moment.
+        let mut m = mkt("X", None, None);
+        m.price_usd = 120.0;
+        m.price_low_52w = Some(50.0);
+        m.price_high_52w = Some(100.0);
+        assert_eq!(m.range_position(), Some(1.0));
+    }
+
+    #[test]
+    fn range_position_is_none_without_both_edges() {
+        let m = mkt("X", None, None);
+        assert!(m.range_position().is_none());
     }
 
     #[test]

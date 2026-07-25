@@ -4,51 +4,69 @@
 // the read-only key never needs to live in the client, in this repo, or
 // in any chat/tool history.
 //
-// Route: GET /market/:symbol  (symbol already normalized, e.g. TSLAon)
-// Caches each symbol at the edge for 30s so many concurrent Hyperium users
-// asking about the same ticker collapse into one upstream call.
+// Routes:
+//   GET /market/:symbol  one symbol (already normalized, e.g. TSLAon),
+//                        cached at the edge per-symbol for 30s.
+//   GET /market-all      every supported asset in one call
+//                        (upstream: GET /v1/assets/all/market), cached at
+//                        the edge for 20s — this is the bulk pull
+//                        ondo_screen uses to cover the whole watchlist
+//                        instead of one request per symbol.
+// Both routes collapse concurrent Hyperium users into one upstream call per
+// cache window, so this stays cheap against Ondo's own rate limits.
 
 const ONDO_BASE = "https://api.gm.ondo.finance/v1";
 const CACHE_SECONDS = 30;
+const ALL_CACHE_SECONDS = 20;
 const SYMBOL_RE = /^[A-Za-z0-9]{1,15}$/;
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const match = url.pathname.match(/^\/market\/([^/]+)$/);
 
-    if (request.method !== "GET" || !match) {
+    if (request.method !== "GET") {
       return json({ error: "not found" }, 404);
     }
 
+    if (url.pathname === "/market-all") {
+      return proxy(url, request, ctx, env, "/assets/all/market", ALL_CACHE_SECONDS);
+    }
+
+    const match = url.pathname.match(/^\/market\/([^/]+)$/);
+    if (!match) {
+      return json({ error: "not found" }, 404);
+    }
     const symbol = match[1];
     if (!SYMBOL_RE.test(symbol)) {
       return json({ error: "invalid symbol" }, 400);
     }
-
-    const cache = caches.default;
-    const cacheKey = new Request(url.toString(), request);
-    const cached = await cache.match(cacheKey);
-    if (cached) return cached;
-
-    const upstream = await fetch(`${ONDO_BASE}/assets/${symbol}/market`, {
-      headers: { "x-api-key": env.ONDO_API_KEY },
-    });
-
-    const body = await upstream.text();
-    const resp = new Response(body, {
-      status: upstream.status,
-      headers: {
-        "content-type": "application/json",
-        "access-control-allow-origin": "*",
-        "cache-control": `public, max-age=${CACHE_SECONDS}`,
-      },
-    });
-
-    if (upstream.ok) ctx.waitUntil(cache.put(cacheKey, resp.clone()));
-    return resp;
+    return proxy(url, request, ctx, env, `/assets/${symbol}/market`, CACHE_SECONDS);
   },
 };
+
+async function proxy(url, request, ctx, env, upstreamPath, cacheSeconds) {
+  const cache = caches.default;
+  const cacheKey = new Request(url.toString(), request);
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
+
+  const upstream = await fetch(`${ONDO_BASE}${upstreamPath}`, {
+    headers: { "x-api-key": env.ONDO_API_KEY },
+  });
+
+  const body = await upstream.text();
+  const resp = new Response(body, {
+    status: upstream.status,
+    headers: {
+      "content-type": "application/json",
+      "access-control-allow-origin": "*",
+      "cache-control": `public, max-age=${cacheSeconds}`,
+    },
+  });
+
+  if (upstream.ok) ctx.waitUntil(cache.put(cacheKey, resp.clone()));
+  return resp;
+}
 
 function json(obj, status) {
   return new Response(JSON.stringify(obj), {

@@ -51,8 +51,13 @@ const ROW_HOVER: Color32 = Color32::from_rgb(34, 36, 41);
 /// through all three is a tour of everything the agent does. Written with bare
 /// tickers because the model resolves against the whitelist, and a starter that
 /// missed would teach the wrong lesson about what the agent accepts.
-const EXAMPLES: &[&str] =
-    &["price of WETH", "1 WETH in USDG", "what's pumping", "what's got good volume"];
+const EXAMPLES: &[&str] = &[
+    "price of WETH",
+    "1 WETH in USDG",
+    "what's heating up on Robinhood Chain",
+    "which Ondo stock has unusual volume",
+    "any Ondo stock near a 52-week high",
+];
 
 /// Phrases cycled while a request is in flight. They name the step actually
 /// under way, so the wait reads as work rather than as a hang.
@@ -126,17 +131,30 @@ actually needs real data.
 
 Tools available: market_overview (whole crypto market via CoinGecko, 24h volume only), \
 screen_chain (what's trading on Robinhood Chain right now via Dexscreener, real 5m/1h/6h/24h \
-windows), lookup_token (everything on one Robinhood Chain ticker — works for ANY token \
-there, including ones minutes old — and is also what puts up the swap card the user can \
-act on), get_price and get_quote (restricted to this short curated whitelist only:\n{}\
+windows), chain_screen (the same chain ranked by unusualness instead of raw volume — see the \
+paragraph below), lookup_token (everything on one Robinhood Chain ticker — works for ANY \
+token there, including ones minutes old — and is also what puts up the swap card the user \
+can act on), get_price and get_quote (restricted to this short curated whitelist only:\n{}\
 wallet_balance (the imported wallet's real on-chain balance of one token, read live — this \
 is the ONLY way you ever know what's in the wallet), execute_swap (actually sends a swap on \
 Robinhood Chain from the imported wallet — see the paragraph below on when to call it), \
-lookup_stock (reference price for one Ondo Finance tokenized US stock — TSLA/TSLAon, \
-AAPL/AAPLon, etc). Prefer screen_chain over market_overview when Robinhood Chain is what's \
-actually meant, since it has finer windows market_overview structurally can't. Prefer \
+lookup_stock (reference price for one named Ondo Finance tokenized US stock — TSLA/TSLAon, \
+AAPL/AAPLon, etc), ondo_screen (scans EVERY Ondo Stocks asset at once, ranked by unusualness \
+— see the paragraph below). Prefer screen_chain over market_overview when Robinhood Chain is \
+what's actually meant, since it has finer windows market_overview structurally can't. Prefer \
 lookup_token over get_price/get_quote for anything not in that whitelist above — that's the \
 common case, not the exception, for tokens on this chain.
+
+Two tools exist purely to answer \"what's unusual\" rather than \"what's busy\", and both do \
+the actual comparison in Rust rather than handing you a pile of numbers to eyeball — read the \
+ratio, don't recompute it: chain_screen ranks Robinhood Chain by heat_ratio (last hour's \
+volume against that token's own flat 24h pace) and also carries a buy-pressure percentage \
+per row (share of last-hour trades that were buys); ondo_screen ranks the Ondo watchlist by \
+volume_ratio (today's volume against each stock's own trailing average) and also carries a \
+52-week range position per row (0% at the 52w low, 100% at the 52w high — useful for \"near \
+its high/low\" questions). Call these instead of screen_chain/lookup_stock whenever the \
+question is about the set as a whole rather than one specific token — \"what's heating up\", \
+\"more volume than usual\", \"anything unusual today\", \"near a 52-week high\".
 
 Ondo Finance's tokenized stocks are a completely separate thing from everything else here: a \
 different chain (Ethereum/BNB/Solana, not Robinhood Chain), a different product, no swap card, \
@@ -227,8 +245,12 @@ const T_AGE: f32 = 66.0;
 const T_TABLE_W: f32 =
     T_RANK + T_SYM + T_DEX + T_PRICE + T_CHG + T_VOL1H + T_VOL + T_LIQ + T_AGE;
 
-// Ondo Stocks dashboard. No volume field exists in Ondo's `market` response,
-// so the name column takes the room the market table gives volume instead.
+// Ondo Stocks dashboard. The watchlist table itself stays price/change/spark
+// (volume swings by orders of magnitude across large-caps, a bad fit for a
+// fixed column next to a sparkline) — `ondo_screen` is where volume actually
+// gets used, ranking by today's volume against each stock's own average
+// rather than displaying a raw number here that would mean nothing on its
+// own. The name column takes the room the market table gives volume instead.
 const O_RANK: f32 = 30.0;
 const O_SYM: f32 = 74.0;
 const O_NAME: f32 = 240.0;
@@ -263,6 +285,14 @@ enum Outcome {
     /// Informational only: there is no swap card, no mint/redeem, nothing to
     /// click here yet — see `ondo.rs`.
     Stock { symbol: String, name: Option<String>, price_usd: f64, change_24h: Option<f64> },
+    /// The Ondo watchlist ranked by `volume_ratio` — answers "which of these
+    /// is trading more than usual", the kind of screening question a single
+    /// `lookup_stock` call can't (it only ever sees one symbol at a time).
+    StockScreen { rows: Vec<ondo::Market> },
+    /// Robinhood Chain ranked by `heat_ratio` instead of raw volume — answers
+    /// "what's heating up right now", a different question from `Screen`'s
+    /// "what's busiest today" even though both draw on the same board.
+    ChainHeat { rows: Vec<trending::Row> },
 }
 
 /// What a completed swap actually did, re-read from the chain side rather
@@ -377,6 +407,26 @@ fn chat_reply(outcome: &Outcome) -> String {
         Outcome::Stock { symbol, price_usd, .. } => {
             format!("{symbol} is at {} on Ondo (reference price, not tradable here).", market::money_price(*price_usd))
         }
+        // Sorted by `ondo::screen` already, so the first entry with a usable
+        // ratio is the whole answer — same "top of a ranked list" shape as
+        // `Outcome::Market` above.
+        Outcome::StockScreen { rows } => match rows.first().and_then(|r| r.volume_ratio().map(|ratio| (r, ratio))) {
+            Some((top, ratio)) => format!(
+                "{} is running about {ratio:.1}x its usual volume today — the most unusual on \
+                 the watchlist right now.",
+                top.symbol,
+            ),
+            None => "Nothing on the watchlist has a usable volume reading right now.".to_string(),
+        },
+        // Sorted by `screen_heat` already, same "top of a ranked list" shape.
+        Outcome::ChainHeat { rows } => match rows.first().and_then(|r| r.heat_ratio().map(|ratio| (r, ratio))) {
+            Some((top, ratio)) => format!(
+                "{} is running about {ratio:.1}x its normal hourly pace on Robinhood Chain — \
+                 the most unusual right now.",
+                top.symbol,
+            ),
+            None => "Nothing on Robinhood Chain has a usable volume reading right now.".to_string(),
+        },
     }
 }
 
@@ -743,6 +793,26 @@ fn agent_tools() -> Vec<crate::llm::ToolSpec> {
             }),
         },
         crate::llm::ToolSpec {
+            name: "chain_screen",
+            description: "Scans Robinhood Chain and ranks it by how unusual the LAST HOUR's \
+                activity is, not by raw volume like screen_chain — this is the tool for \
+                \"what's heating up\", \"more volume than usual\", \"anything unusual right \
+                now\" on this chain. Each row carries two numbers, both computed in Rust, \
+                never estimate either yourself: a heat ratio (last hour's volume against that \
+                token's own flat 24h pace — 1.0x is normal, 3.0x is running 3x its usual hourly \
+                rate) and a buy-pressure percentage for the last hour (share of trades that \
+                were buys, not sells — 50% is neutral). Takes no arguments beyond an optional \
+                limit; a token with almost no volume is excluded first so the ratio isn't just \
+                noise from a near-empty pool. Use screen_chain instead for \"what's busiest\" \
+                or \"what just launched\" — those are about raw activity, not unusualness.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "description": "default 15, max 30" }
+                }
+            }),
+        },
+        crate::llm::ToolSpec {
             name: "lookup_token",
             description: "Everything known about one specific ticker trading on Robinhood \
                 Chain — price, every volume/change window, liquidity, market cap, FDV, \
@@ -802,6 +872,21 @@ fn agent_tools() -> Vec<crate::llm::ToolSpec> {
                 "properties": { "ticker": { "type": "string", "description": "e.g. \"TSLA\" or \"TSLAon\"" } },
                 "required": ["ticker"]
             }),
+        },
+        crate::llm::ToolSpec {
+            name: "ondo_screen",
+            description: "Scans EVERY Ondo Stocks asset Ondo supports in one call (Ondo's own \
+                bulk market-data endpoint, not a fixed shortlist) and ranks the whole set by \
+                today's real trading volume against each stock's own trailing average — this \
+                is the tool for \"which Ondo stock has unusual volume\", \"more volume than \
+                usual\", \"what's active on Ondo right now\", or any question about the set as \
+                a whole rather than one ticker. A ratio of 1.0 is normal; 2.0 means twice the \
+                usual volume today. Do the comparison by reading the ratios this tool returns \
+                — never estimate \"usual\" volume yourself, it's a real trailing average from \
+                Ondo, not something to guess at. Takes no arguments; it always scans \
+                everything. Use lookup_stock instead once you already know which one ticker \
+                someone wants.",
+            input_schema: json!({ "type": "object", "properties": {} }),
         },
         crate::llm::ToolSpec {
             name: "execute_swap",
@@ -886,6 +971,52 @@ fn tool_result_text(outcome: &Outcome) -> String {
                     market::money_price(*price_usd)
                 ),
             }
+        }
+        Outcome::StockScreen { rows } => {
+            let mut out = String::from(
+                "Ondo watchlist, ranked by today's volume vs each stock's own average (1.0x = \
+                 normal). Also shown: 52-week range position (0% = at the 52w low, 100% = at \
+                 the 52w high):\n",
+            );
+            for r in rows {
+                let ratio = r
+                    .volume_ratio()
+                    .map(|x| format!("{x:.2}x average volume"))
+                    .unwrap_or_else(|| "no volume reading".to_string());
+                let range = r
+                    .range_position()
+                    .map(|p| format!("{:.0}% of 52w range", p * 100.0))
+                    .unwrap_or_else(|| "no 52w range".to_string());
+                out.push_str(&format!(
+                    "- {} · {} · {ratio} · {range}\n",
+                    r.symbol,
+                    market::money_price(r.price_usd),
+                ));
+            }
+            out
+        }
+        Outcome::ChainHeat { rows } => {
+            let mut out = String::from(
+                "Robinhood Chain, ranked by the last hour's volume against its own flat daily \
+                 pace (1.0x = normal). Also shown: buy pressure over the last hour (share of \
+                 trades that were buys, not sells):\n",
+            );
+            for r in rows {
+                let heat = r
+                    .heat_ratio()
+                    .map(|x| format!("{x:.2}x hourly pace"))
+                    .unwrap_or_else(|| "no volume reading".to_string());
+                let pressure = r
+                    .buy_pressure_h1()
+                    .map(|p| format!("{:.0}% buys", p * 100.0))
+                    .unwrap_or_else(|| "no trades this hour".to_string());
+                out.push_str(&format!(
+                    "- {} · {} · {heat} · {pressure}\n",
+                    r.symbol,
+                    market::money_price(r.price_usd),
+                ));
+            }
+            out
         }
     }
 }
@@ -1091,6 +1222,10 @@ fn dispatch_tool(
             let window = input["window"].as_str().and_then(trending::Window::parse).unwrap_or(trending::Window::H24);
             run(Intent::ChainScreen { limit, window }, api_key, "", "")
         }
+        "chain_screen" => {
+            let limit = input["limit"].as_u64().unwrap_or(15).clamp(1, intent::SCREEN_LIMIT_MAX as u64) as usize;
+            trending::screen_heat(limit).map(|rows| Outcome::ChainHeat { rows })
+        }
         "lookup_token" => {
             let ticker = input["ticker"].as_str().unwrap_or_default().trim().trim_start_matches('$').to_string();
             if ticker.is_empty() {
@@ -1113,6 +1248,7 @@ fn dispatch_tool(
                 run(Intent::StockLookup { ticker }, "", "", ondo_key)
             }
         }
+        "ondo_screen" => Ok(Outcome::StockScreen { rows: ondo::screen() }),
         other => Err(format!("unknown tool {other}")),
     };
     match result {
@@ -1631,6 +1767,12 @@ impl SushiTool {
                 (format!("screened {} Robinhood Chain tokens", rows.len()), true)
             }
             Ok(Outcome::Stock { symbol, .. }) => (format!("read {symbol} on Ondo"), true),
+            Ok(Outcome::StockScreen { rows }) => {
+                (format!("screened {} Ondo watchlist symbols by volume", rows.len()), true)
+            }
+            Ok(Outcome::ChainHeat { rows }) => {
+                (format!("screened {} Robinhood Chain tokens by heat", rows.len()), true)
+            }
             Ok(Outcome::Chat { card, .. }) => (
                 match card.as_deref() {
                     Some(Outcome::Token { info, .. }) => format!("chatted, read {}", info.symbol),
@@ -3532,6 +3674,89 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                     .color(FAINT)
                     .small(),
             );
+        }
+        Outcome::StockScreen { rows } => {
+            ui.label(
+                RichText::new("ONDO WATCHLIST · by volume vs average").color(ACCENT).small().strong(),
+            );
+            ui.add_space(6.0);
+            if rows.is_empty() {
+                ui.label(RichText::new("nothing came back").color(FAINT).small());
+            }
+            for r in rows {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(&r.symbol)
+                            .color(FG)
+                            .font(FontId::monospace(13.5))
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new(market::money_price(r.price_usd))
+                            .color(DIM)
+                            .font(FontId::monospace(12.5)),
+                    );
+                    let (text, color) = match r.volume_ratio() {
+                        Some(x) if x >= 1.0 => (format!("{x:.2}x average"), UP),
+                        Some(x) => (format!("{x:.2}x average"), DIM),
+                        None => ("no volume reading".to_string(), FAINT),
+                    };
+                    ui.label(RichText::new(text).color(color).small());
+                    if let Some(p) = r.range_position() {
+                        ui.label(
+                            RichText::new(format!("{:.0}% of 52w range", p * 100.0))
+                                .color(if p >= 0.9 || p <= 0.1 { ORANGE } else { FAINT })
+                                .small(),
+                        );
+                    }
+                });
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Reference prices only — not tradable from this app yet.")
+                    .color(FAINT)
+                    .small(),
+            );
+        }
+        Outcome::ChainHeat { rows } => {
+            ui.label(
+                RichText::new("ROBINHOOD CHAIN · by heat vs normal pace")
+                    .color(ORANGE)
+                    .small()
+                    .strong(),
+            );
+            ui.add_space(6.0);
+            if rows.is_empty() {
+                ui.label(RichText::new("nothing came back").color(FAINT).small());
+            }
+            for r in rows {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(&r.symbol)
+                            .color(FG)
+                            .font(FontId::monospace(13.5))
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new(market::money_price(r.price_usd))
+                            .color(DIM)
+                            .font(FontId::monospace(12.5)),
+                    );
+                    let (text, color) = match r.heat_ratio() {
+                        Some(x) if x >= 1.0 => (format!("{x:.2}x hourly pace"), ORANGE),
+                        Some(x) => (format!("{x:.2}x hourly pace"), DIM),
+                        None => ("no volume reading".to_string(), FAINT),
+                    };
+                    ui.label(RichText::new(text).color(color).small());
+                    if let Some(p) = r.buy_pressure_h1() {
+                        ui.label(
+                            RichText::new(format!("{:.0}% buys", p * 100.0))
+                                .color(if p >= 0.5 { UP } else { RED })
+                                .small(),
+                        );
+                    }
+                });
+            }
         }
     }
 }

@@ -137,6 +137,24 @@ impl Row {
             Window::H24 => self.volume_h24,
         }
     }
+
+    /// How many times the last hour's volume beats the flat 1/24th share of
+    /// today's — 1.0 is trading exactly at its own daily pace, 3.0 means the
+    /// last hour alone did 3x its fair share of today's volume. `None` with
+    /// no 24h volume to compare against, where a ratio would be meaningless
+    /// rather than merely large.
+    pub fn heat_ratio(&self) -> Option<f64> {
+        (self.volume_h24 > 0.0).then(|| self.volume_h1 / (self.volume_h24 / 24.0))
+    }
+
+    /// Share of the last hour's trade count that was buys — 0.5 is neutral,
+    /// above leans buy-heavy, below sell-heavy. `None` with zero trades in
+    /// the window, where any ratio would be an artifact of the denominator
+    /// rather than a real read on sentiment.
+    pub fn buy_pressure_h1(&self) -> Option<f64> {
+        let total = self.buys_h1 + self.sells_h1;
+        (total > 0).then(|| self.buys_h1 as f64 / total as f64)
+    }
 }
 
 /// True for Dexscreener's own spelling of Sushi's pools. Exact match, not a
@@ -280,7 +298,9 @@ fn pairs_for(address: &str) -> Result<Vec<Value>, String> {
     }
 }
 
-pub fn fetch(limit: usize, window: Window) -> Result<Vec<Row>, String> {
+/// Every pair across all three quote sides — the raw material both `fetch`
+/// and `screen_heat` rank differently, fetched identically either way.
+fn all_pairs() -> Result<Vec<Value>, String> {
     let chain = super::tokens::chain_by_name(CHAIN_NAME)
         .ok_or("no Robinhood chain in the registry")?;
 
@@ -297,8 +317,41 @@ pub fn fetch(limit: usize, window: Window) -> Result<Vec<Row>, String> {
     if raw.is_empty() {
         return Err(last_err.unwrap_or_else(|| "no pairs returned".into()));
     }
+    Ok(raw)
+}
 
+pub fn fetch(limit: usize, window: Window) -> Result<Vec<Row>, String> {
+    let raw = all_pairs()?;
     let rows = rank(&raw, limit, window);
+    if rows.is_empty() {
+        return Err("no tradable pairs on this chain right now".into());
+    }
+    Ok(rows)
+}
+
+/// A minimum 24h volume before a heat ratio means anything — without it, a
+/// pool doing $40 of volume in the last hour against $50 all day reads as an
+/// absurd multiple that's really just illiquid noise, not a token actually
+/// heating up. $1,000 is well below anything that would show up on the
+/// volume-ranked board anyway, so this only filters out the pairs too thin
+/// for the ratio to be a real signal in the first place.
+const MIN_VOLUME_FOR_HEAT: f64 = 1_000.0;
+
+/// Ranked by `heat_ratio` (last hour's volume against the day's own flat
+/// pace) instead of raw volume — this is what answers "what's heating up
+/// right now" as a real computed number rather than something read off a
+/// volume-sorted list and eyeballed.
+pub fn screen_heat(limit: usize) -> Result<Vec<Row>, String> {
+    let raw = all_pairs()?;
+    let mut rows = dedup_rows(&raw);
+    rows.retain(|r| r.volume_h24 >= MIN_VOLUME_FOR_HEAT);
+    rows.sort_by(|a, b| {
+        b.heat_ratio()
+            .unwrap_or(f64::NEG_INFINITY)
+            .partial_cmp(&a.heat_ratio().unwrap_or(f64::NEG_INFINITY))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rows.truncate(limit);
     if rows.is_empty() {
         return Err("no tradable pairs on this chain right now".into());
     }
@@ -427,6 +480,18 @@ fn urlencode(s: &str) -> String {
 /// sometimes several fee tiers. Showing each would fill the board with
 /// duplicates, so the pair doing the most volume wins and stands for the token.
 fn rank(raw: &[Value], limit: usize, window: Window) -> Vec<Row> {
+    let mut best = dedup_rows(raw);
+    best.sort_by(|a, b| {
+        b.volume(window).partial_cmp(&a.volume(window)).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    best.truncate(limit);
+    best
+}
+
+/// One row per token, the busiest of its pools — the half of `rank` that
+/// isn't about *order*. Split out so a different ranking (`screen_heat`) can
+/// reuse the exact same dedup rule instead of drifting from it.
+fn dedup_rows(raw: &[Value]) -> Vec<Row> {
     let mut best: Vec<Row> = Vec::new();
 
     for p in raw {
@@ -486,10 +551,6 @@ fn rank(raw: &[Value], limit: usize, window: Window) -> Vec<Row> {
         }
     }
 
-    best.sort_by(|a, b| {
-        b.volume(window).partial_cmp(&a.volume(window)).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    best.truncate(limit);
     best
 }
 
@@ -551,6 +612,41 @@ mod tests {
 
         let by_m5 = rank(&raw, 10, Window::M5);
         assert_eq!(by_m5[0].symbol, "A");
+    }
+
+    #[test]
+    fn heat_ratio_reads_h1_against_h24s_flat_pace() {
+        // volume_h1 = vol/10, volume_h24 = vol from the `pair` helper, so the
+        // ratio is a fixed 24/10 = 2.4x regardless of the base volume.
+        let raw = vec![pair("X", "0xx", 1000.0)];
+        let row = &rank(&raw, 10, Window::H24)[0];
+        assert!((row.heat_ratio().unwrap() - 2.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn heat_ratio_is_none_with_no_24h_volume() {
+        let mut p = pair("X", "0xx", 0.0);
+        p["volume"]["h1"] = json!(0.0);
+        let raw = vec![p];
+        let row = &rank(&raw, 10, Window::H24)[0];
+        assert!(row.heat_ratio().is_none());
+    }
+
+    #[test]
+    fn buy_pressure_h1_reads_the_h1_split() {
+        // pair() sets h1 buys/sells to 8/5.
+        let raw = vec![pair("X", "0xx", 1000.0)];
+        let row = &rank(&raw, 10, Window::H24)[0];
+        assert!((row.buy_pressure_h1().unwrap() - (8.0 / 13.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn buy_pressure_h1_is_none_with_no_trades() {
+        let mut p = pair("X", "0xx", 1000.0);
+        p["txns"]["h1"] = json!({ "buys": 0, "sells": 0 });
+        let raw = vec![p];
+        let row = &rank(&raw, 10, Window::H24)[0];
+        assert!(row.buy_pressure_h1().is_none());
     }
 
     #[test]
