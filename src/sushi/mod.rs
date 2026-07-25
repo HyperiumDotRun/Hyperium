@@ -375,6 +375,13 @@ enum Outcome {
         payout_frequency: Option<String>,
         last_cash_amount: Option<f64>,
         last_payment_date: Option<String>,
+        /// How much the shares multiplier has grown over the last year —
+        /// real, on-chain-recorded history of dividends compounding in
+        /// (`ondo::multiplier_growth`), not a current-vs-current guess.
+        /// `None` when Ondo has no history for it yet (a token minutes old)
+        /// or the lookup itself failed — this stays optional rather than
+        /// failing the whole dividend read over it.
+        multiplier_growth_1y: Option<f64>,
     },
 }
 
@@ -864,12 +871,19 @@ fn run(intent: Intent, api_key: &str, ai_key: &str, ondo_key: &str) -> Result<Ou
         }
         Intent::DividendLookup { ticker } => {
             let d = ondo::dividends(&ticker, ondo_key)?;
+            // Best-effort: a missing/failed multiplier history still leaves
+            // the current yield/frequency/last-payment answer intact, it
+            // just answers without the historical trend.
+            let multiplier_growth_1y = ondo::multiplier_history(&ticker, "1year", ondo_key)
+                .ok()
+                .and_then(|h| ondo::multiplier_growth(&h));
             Ok(Outcome::Dividend {
                 ticker: d.ticker,
                 yield_frac: d.yield_frac,
                 payout_frequency: d.payout_frequency,
                 last_cash_amount: d.last_cash_amount,
                 last_payment_date: d.last_payment_date,
+                multiplier_growth_1y,
             })
         }
     }
@@ -1005,13 +1019,19 @@ fn agent_tools() -> Vec<crate::llm::ToolSpec> {
         },
         crate::llm::ToolSpec {
             name: "lookup_dividend",
-            description: "Dividend info for one named Ondo Finance tokenized stock: \
-                annualized yield, how often it pays (monthly/quarterly/etc, or none), and the \
-                last cash amount/date. A separate call from lookup_stock — that one is price, \
-                this one is dividends, and most questions only need one of the two. Important: \
-                Ondo doesn't pay this out in cash to a holder here — it compounds into the \
-                token's own price instead (the \"shares multiplier\" mentioned elsewhere), so \
-                mention that if someone sounds like they're expecting a cash payment.",
+            description: "Dividend info for one named Ondo Finance tokenized stock: current \
+                annualized yield, how often it pays (monthly/quarterly/etc, or none), the last \
+                cash amount/date, AND real historical context — how much the token's shares \
+                multiplier (the on-chain mechanism that absorbs reinvested dividends) has grown \
+                over the last year. That growth figure is a genuine trailing-12-month read, \
+                computed from Ondo's own recorded history, not the current yield repeated or \
+                estimated — use it whenever someone asks about the yield historically or \
+                compares it to a past period; don't say you have no historical data, this tool \
+                is exactly that. A separate call from lookup_stock — that one is price, this \
+                one is dividends, and most questions only need one of the two. Important: Ondo \
+                doesn't pay any of this out in cash to a holder here — it compounds into the \
+                token's own price instead, so mention that if someone sounds like they're \
+                expecting a cash payment.",
             input_schema: json!({
                 "type": "object",
                 "properties": { "ticker": { "type": "string", "description": "e.g. \"TSLA\" or \"TSLAon\"" } },
@@ -1176,17 +1196,29 @@ fn tool_result_text(outcome: &Outcome) -> String {
             }
             out
         }
-        Outcome::Dividend { ticker, yield_frac, payout_frequency, last_cash_amount, last_payment_date } => {
+        Outcome::Dividend {
+            ticker,
+            yield_frac,
+            payout_frequency,
+            last_cash_amount,
+            last_payment_date,
+            multiplier_growth_1y,
+        } => {
+            let growth = multiplier_growth_1y
+                .map(|g| format!(" Over the last year, the on-chain shares multiplier that \
+                     absorbs reinvested dividends grew {:.2}% — real recorded history, not an \
+                     estimate.", g * 100.0))
+                .unwrap_or_default();
             match (yield_frac, payout_frequency.as_deref()) {
                 (Some(y), Some(freq)) => format!(
-                    "{ticker} dividend: {:.2}% annualized yield, paid {freq}. Last payment: {}{}.",
+                    "{ticker} dividend: {:.2}% annualized yield, paid {freq}. Last payment: {}{}.{growth}",
                     y * 100.0,
                     last_cash_amount.map(|c| format!("${c:.2}/share")).unwrap_or_else(|| "unknown amount".into()),
                     last_payment_date.as_deref().map(|d| format!(" on {d}")).unwrap_or_default(),
                 ),
                 _ => format!(
-                    "{ticker}: no dividend data on file (either it doesn't pay one, or Ondo \
-                     hasn't recorded one for it)."
+                    "{ticker}: no current dividend data on file (either it doesn't pay one, or \
+                     Ondo hasn't recorded one for it).{growth}"
                 ),
             }
         }
@@ -4075,7 +4107,14 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                 });
             }
         }
-        Outcome::Dividend { ticker, yield_frac, payout_frequency, last_cash_amount, last_payment_date } => {
+        Outcome::Dividend {
+            ticker,
+            yield_frac,
+            payout_frequency,
+            last_cash_amount,
+            last_payment_date,
+            multiplier_growth_1y,
+        } => {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(ticker).color(FG).strong());
                 ui.label(RichText::new("Dividend · Ondo Finance").color(DIM).small());
@@ -4113,9 +4152,23 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                 }
                 _ => {
                     ui.label(
-                        RichText::new("No dividend on file for this one.").color(FAINT).small(),
+                        RichText::new("No current dividend on file for this one.")
+                            .color(FAINT)
+                            .small(),
                     );
                 }
+            }
+            if let Some(g) = multiplier_growth_1y {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Shares multiplier grew {:.2}% over the last year — the real, \
+                         on-chain-recorded trail of dividends compounding in.",
+                        g * 100.0
+                    ))
+                    .color(if *g >= 0.0 { UP } else { RED })
+                    .small(),
+                );
             }
         }
     }

@@ -13,10 +13,17 @@
 //                           the edge for 20s — this is the bulk pull
 //                           ondo_screen uses to cover the whole watchlist
 //                           instead of one request per symbol.
-//   GET /dividends/:symbol  one symbol's dividend info (yield, payout
-//                           frequency, last cash amount/date), cached for
-//                           1 hour — this data changes at most quarterly,
-//                           nowhere near as often as a price.
+//   GET /dividends/:symbol   one symbol's dividend info (yield, payout
+//                            frequency, last cash amount/date), cached for
+//                            1 hour — this data changes at most quarterly,
+//                            nowhere near as often as a price.
+//   GET /multiplier/:symbol  one symbol's shares-multiplier history
+//                            (upstream: GET /v1/assets/{symbol}/shares-multiplier),
+//                            forwarding the required ?range= query param
+//                            (1day/1month/3month/6month/1year/all). This is
+//                            the real historical trail of how dividends have
+//                            compounded into the token's price - cached for
+//                            1 hour, same reasoning as dividends.
 // All routes collapse concurrent Hyperium users into one upstream call per
 // cache window, so this stays cheap against Ondo's own rate limits.
 
@@ -24,7 +31,9 @@ const ONDO_BASE = "https://api.gm.ondo.finance/v1";
 const CACHE_SECONDS = 30;
 const ALL_CACHE_SECONDS = 20;
 const DIVIDEND_CACHE_SECONDS = 3600;
+const MULTIPLIER_CACHE_SECONDS = 3600;
 const SYMBOL_RE = /^[A-Za-z0-9]{1,15}$/;
+const RANGE_RE = /^(1day|1month|3month|6month|1year|all)$/;
 
 export default {
   async fetch(request, env, ctx) {
@@ -54,6 +63,26 @@ export default {
         return json({ error: "invalid symbol" }, 400);
       }
       return proxy(url, request, ctx, env, `/assets/${symbol}/dividends`, DIVIDEND_CACHE_SECONDS);
+    }
+
+    const multiplierMatch = url.pathname.match(/^\/multiplier\/([^/]+)$/);
+    if (multiplierMatch) {
+      const symbol = multiplierMatch[1];
+      const range = url.searchParams.get("range") || "1year";
+      if (!SYMBOL_RE.test(symbol)) {
+        return json({ error: "invalid symbol" }, 400);
+      }
+      if (!RANGE_RE.test(range)) {
+        return json({ error: "invalid range" }, 400);
+      }
+      return proxy(
+        url,
+        request,
+        ctx,
+        env,
+        `/assets/${symbol}/shares-multiplier?range=${range}`,
+        MULTIPLIER_CACHE_SECONDS,
+      );
     }
 
     return json({ error: "not found" }, 404);

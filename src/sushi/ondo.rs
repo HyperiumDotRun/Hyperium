@@ -78,6 +78,17 @@ fn get_proxy_dividends(symbol: &str) -> Result<Value, String> {
     read_response(resp)
 }
 
+/// The proxy's `/multiplier/:symbol` route (upstream `GET
+/// /v1/assets/{symbol}/shares-multiplier?range=...`) — real historical data,
+/// not derived: Ondo tracks every change to the multiplier that absorbs a
+/// stock's reinvested dividends, so this is an honest trail of compounding
+/// rather than something reconstructed from a shorter window.
+fn get_proxy_multiplier(symbol: &str, range: &str) -> Result<Value, String> {
+    let url = format!("{PROXY_BASE}/multiplier/{symbol}?range={range}");
+    let resp = agent().get(&url).call();
+    read_response(resp)
+}
+
 fn read_response(resp: Result<ureq::Response, ureq::Error>) -> Result<Value, String> {
     match resp {
         Ok(r) => r.into_json().map_err(|e| format!("bad response: {e}")),
@@ -189,6 +200,51 @@ fn parse_dividend(v: &Value) -> Result<Dividend, String> {
         last_cash_amount: num(&v["lastCashAmount"]),
         last_payment_date: v["lastPaymentDate"].as_str().map(str::to_string),
     })
+}
+
+/// One recorded change to a token's shares multiplier — the mechanism that
+/// absorbs a stock's reinvested dividends on-chain (see the module doc
+/// comment). A rising multiplier over time *is* the compounding effect of
+/// dividends that never get paid out here.
+#[derive(Debug, Clone, Copy)]
+pub struct MultiplierPoint {
+    pub multiplier: f64,
+    pub changed_at_ms: u64,
+}
+
+/// `range` is Ondo's own vocabulary: "1day", "1month", "3month", "6month",
+/// "1year", or "all". Entries come back newest-first (matches Ondo's own
+/// ordering) — callers after growth over the period want `.last()` as the
+/// oldest point in range, not `.first()`.
+pub fn multiplier_history(ticker: &str, range: &str, api_key: &str) -> Result<Vec<MultiplierPoint>, String> {
+    let symbol = normalize_symbol(ticker);
+    let v = if api_key.trim().is_empty() {
+        get_proxy_multiplier(&symbol, range)?
+    } else {
+        get(&format!("/assets/{symbol}/shares-multiplier?range={range}"), api_key)?
+    };
+    let history = v["history"].as_array().ok_or("unexpected response shape from shares-multiplier")?;
+    Ok(history
+        .iter()
+        .filter_map(|p| {
+            Some(MultiplierPoint {
+                multiplier: num(&p["sharesMultiplier"])?,
+                changed_at_ms: p["changeTimestamp"].as_u64()?,
+            })
+        })
+        .collect())
+}
+
+/// How much the multiplier has grown from the oldest point in `history` to
+/// the newest — the real, on-chain-recorded effect of dividends compounding
+/// in over that stretch, as a fraction (0.02 = 2%). `None` with fewer than
+/// two points (nothing to compare) or a zero/negative starting value (a
+/// division artifact, not a real growth figure).
+pub fn multiplier_growth(history: &[MultiplierPoint]) -> Option<f64> {
+    let newest = history.first()?;
+    let oldest = history.last()?;
+    (oldest.multiplier > 0.0 && newest.changed_at_ms != oldest.changed_at_ms)
+        .then(|| newest.multiplier / oldest.multiplier - 1.0)
 }
 
 /// Normalizes a bare ticker (`TSLA`) to Ondo's symbol convention — minimum 3
@@ -381,6 +437,30 @@ mod tests {
         assert_eq!(d.ticker, "META");
         assert!(d.yield_frac.is_none());
         assert_eq!(d.payout_frequency.as_deref(), Some("none"));
+    }
+
+    fn point(multiplier: f64, changed_at_ms: u64) -> MultiplierPoint {
+        MultiplierPoint { multiplier, changed_at_ms }
+    }
+
+    #[test]
+    fn multiplier_growth_compares_newest_against_oldest() {
+        // Newest-first, matching Ondo's own ordering.
+        let history = vec![point(1.05, 300), point(1.02, 200), point(1.00, 100)];
+        assert!((multiplier_growth(&history).unwrap() - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn multiplier_growth_is_none_with_a_single_point() {
+        let history = vec![point(1.05, 300)];
+        assert!(multiplier_growth(&history).is_none());
+    }
+
+    #[test]
+    fn multiplier_growth_is_none_when_the_range_has_no_actual_span() {
+        // Same single change reported as both the newest and oldest point.
+        let history = vec![point(1.05, 300), point(1.05, 300)];
+        assert!(multiplier_growth(&history).is_none());
     }
 
     /// `get` (the bring-your-own-key path) must still short-circuit before
