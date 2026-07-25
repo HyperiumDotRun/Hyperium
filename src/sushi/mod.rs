@@ -87,9 +87,9 @@ const EXAMPLES: &[Example] = &[
     Example {
         text: "dividend yield of AAPL on Ondo",
         hint: Some(
-            "Ondo doesn't pay this out in cash here — it compounds into the token's \
-             own price instead, which is why the price drifts above the real \
-             stock's over time.",
+            "Pulls this stock's real dividend data straight from Ondo: annualized \
+             yield, how often it pays (monthly/quarterly/etc), and the last cash \
+             amount and date paid.",
         ),
     },
 ];
