@@ -4,4 +4,8 @@
 /release/*.exe
 /release/*.zip
 /release/*.cer
+/release/*.pfx
+/release/*.pvk
 /release/latest.json
+*.hyp
+/hyperium-notes/
