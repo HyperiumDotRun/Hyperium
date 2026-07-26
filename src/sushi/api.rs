@@ -91,6 +91,10 @@ pub struct Quote {
     pub amount_out: u128,
     /// Fraction, not percent: 0.005 means 0.5%.
     pub price_impact: Option<f64>,
+    /// Intermediate tokens the route passes through, in response order.
+    /// Empty for a direct pair. This is the only routing detail the API
+    /// exposes — no pool addresses, no per-hop share.
+    pub route_hops: Vec<QuoteToken>,
 }
 
 impl Quote {
@@ -108,6 +112,11 @@ impl Quote {
         let scaled_in = self.amount_in as f64 / 10f64.powi(self.token_in.decimals as i32);
         let scaled_out = self.amount_out as f64 / 10f64.powi(self.token_out.decimals as i32);
         Some(scaled_out / scaled_in)
+    }
+
+    /// Number of pool hops the route takes: 1 for a direct pair.
+    pub fn hop_count(&self) -> usize {
+        self.route_hops.len() + 1
     }
 }
 
@@ -144,6 +153,34 @@ fn amount_at(v: &Value, key: &str) -> u128 {
     v[key].as_str().and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
+/// Every entry in `tokens[]` that is neither the input nor the output — the
+/// only route signal this API exposes (no pool addresses, no per-hop split;
+/// verified against a live multi-hop response). Matched by address rather
+/// than by index, so it works whether `tokenFrom`/`tokenTo` came back as an
+/// index or an expanded object.
+fn hops_of(v: &Value, token_in: &QuoteToken, token_out: &QuoteToken) -> Vec<QuoteToken> {
+    v["tokens"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    let address = t["address"].as_str()?.to_string();
+                    if address.eq_ignore_ascii_case(&token_in.address)
+                        || address.eq_ignore_ascii_case(&token_out.address)
+                    {
+                        return None;
+                    }
+                    Some(QuoteToken {
+                        address,
+                        symbol: t["symbol"].as_str().unwrap_or("?").to_string(),
+                        decimals: t["decimals"].as_u64().unwrap_or(18) as u32,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn quote(req: &QuoteRequest, api_key: &str) -> Result<Quote, String> {
     let url = format!("{BASE}/quote/v7/{}", req.chain_id);
     let params = [
@@ -163,6 +200,7 @@ pub fn quote(req: &QuoteRequest, api_key: &str) -> Result<Quote, String> {
     else {
         return Err("unexpected response shape (no token data)".into());
     };
+    let route_hops = hops_of(&v, &token_in, &token_out);
 
     Ok(Quote {
         status,
@@ -171,6 +209,7 @@ pub fn quote(req: &QuoteRequest, api_key: &str) -> Result<Quote, String> {
         amount_in: amount_at(&v, "amountIn"),
         amount_out: amount_at(&v, "assumedAmountOut"),
         price_impact: v["priceImpact"].as_f64(),
+        route_hops,
     })
 }
 
@@ -194,7 +233,17 @@ pub struct Swap {
     pub amount_in: u128,
     pub amount_out: u128,
     pub price_impact: Option<f64>,
+    /// Intermediate tokens the route passes through, in response order.
+    /// Empty for a direct pair. See `Quote::route_hops`.
+    pub route_hops: Vec<QuoteToken>,
     pub tx: Tx,
+}
+
+impl Swap {
+    /// Number of pool hops the route takes: 1 for a direct pair.
+    pub fn hop_count(&self) -> usize {
+        self.route_hops.len() + 1
+    }
 }
 
 pub struct SwapRequest {
@@ -231,6 +280,7 @@ pub fn swap(req: &SwapRequest, api_key: &str) -> Result<Swap, String> {
     else {
         return Err("unexpected response shape (no token data)".into());
     };
+    let route_hops = hops_of(&v, &token_in, &token_out);
     let tx = &v["tx"];
     let (Some(to), Some(data)) = (tx["to"].as_str(), tx["data"].as_str()) else {
         return Err("response carried no transaction to sign".into());
@@ -251,6 +301,7 @@ pub fn swap(req: &SwapRequest, api_key: &str) -> Result<Swap, String> {
         amount_in: amount_at(&v, "amountIn"),
         amount_out: amount_at(&v, "assumedAmountOut"),
         price_impact: v["priceImpact"].as_f64(),
+        route_hops,
         tx: Tx { to: to.to_string(), data: data.to_string(), value },
     })
 }
@@ -289,7 +340,52 @@ mod tests {
             amount_in,
             amount_out,
             price_impact: None,
+            route_hops: Vec::new(),
         }
+    }
+
+    #[test]
+    fn hops_of_extracts_the_middle_token_on_a_multi_hop_response() {
+        // Same shape as a live ETH -> USDC -> DAI response: tokens[] holds all
+        // three, tokenFrom/tokenTo only cover the endpoints.
+        let v: Value = serde_json::from_str(
+            r#"{
+              "tokens": [
+                {"address":"0xaa","decimals":18,"symbol":"ETH","name":"Ether"},
+                {"address":"0xcc","decimals":6,"symbol":"USDC","name":"USD Coin"},
+                {"address":"0xbb","decimals":18,"symbol":"DAI","name":"Dai Stablecoin"}
+              ],
+              "tokenFrom": 0,
+              "tokenTo": 2
+            }"#,
+        )
+        .unwrap();
+        let token_in = QuoteToken { address: "0xaa".into(), symbol: "ETH".into(), decimals: 18 };
+        let token_out = QuoteToken { address: "0xbb".into(), symbol: "DAI".into(), decimals: 18 };
+
+        let hops = hops_of(&v, &token_in, &token_out);
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0].symbol, "USDC");
+        assert_eq!(hops[0].address, "0xcc");
+    }
+
+    #[test]
+    fn hops_of_is_empty_on_a_direct_pair() {
+        let v: Value = serde_json::from_str(
+            r#"{
+              "tokens": [
+                {"address":"0xaa","decimals":18,"symbol":"ETH","name":"Ether"},
+                {"address":"0xbb","decimals":6,"symbol":"USDC","name":"USD Coin"}
+              ],
+              "tokenFrom": 0,
+              "tokenTo": 1
+            }"#,
+        )
+        .unwrap();
+        let token_in = QuoteToken { address: "0xaa".into(), symbol: "ETH".into(), decimals: 18 };
+        let token_out = QuoteToken { address: "0xbb".into(), symbol: "USDC".into(), decimals: 6 };
+
+        assert!(hops_of(&v, &token_in, &token_out).is_empty());
     }
 
     #[test]

@@ -12,6 +12,7 @@
 mod api;
 mod chain_rpc;
 mod erc20;
+mod guardian;
 mod trending;
 mod intent;
 mod market;
@@ -169,6 +170,24 @@ much of this is Uniswap vs Sushi. Cite real figures from the list.
 Never say which one to buy, never rank them by which is the better trade, never call \
 anything safe. Describe the board. Do not pick a winner.";
 
+/// Narrates a quote/swap's path in plain language. Deliberately restricted
+/// to what the API actually returns (see `api::Quote::route_hops`'s doc
+/// comment): no pool addresses, no per-hop percentages — that data doesn't
+/// exist in the response, so the model must not invent it.
+const ROUTE_SYSTEM: &str = "\
+You are explaining, in one or two short plain-language sentences, the path a token swap \
+takes and what its price impact means for the person making it. You are given the token \
+path (e.g. \"ETH -> USDC -> DAI\") and the price impact percentage — nothing more: no pool \
+addresses, no per-hop breakdown, because the API this reads from does not expose that. Do \
+not invent pool names or percentages beyond what you were given.
+
+If the path is direct (no intermediate token), just note that plainly rather than making \
+a big deal of it. If there are one or more hops, say so and, if the price impact is \
+non-trivial, connect the two (e.g. a multi-hop route can compound impact across each leg).
+
+Never tell anyone to go ahead or not to, never say a price will move, never call anything \
+safe. Describe the route, not the decision.";
+
 /// System prompt for the actual conversation (`ask_model`) — as opposed to
 /// `TAKE_SYSTEM`/`SCREEN_SYSTEM`, which each write one card's commentary from
 /// data already fetched. This is the one the user is actually talking to:
@@ -324,7 +343,11 @@ enum Outcome {
     /// is carried alongside the numbers rather than fetched separately so the
     /// card can never show a comment about figures it is no longer displaying.
     Token { info: Box<trending::Info>, take: String },
-    Quote { chain: &'static str, quote: api::Quote },
+    /// `route_note` is the model's plain-language read of the path
+    /// (`ROUTE_SYSTEM`), empty with no AI key configured — same shape as
+    /// `Token`'s `take`. `route_path_words` (deterministic, free) is derived
+    /// from `quote.route_hops` at render time rather than stored here.
+    Quote { chain: &'static str, quote: api::Quote, route_note: String },
     /// Feeds the table rather than the result card.
     Market { rows: Vec<market::Row>, sort: market::Sort, limit: usize },
     /// A chat-requested read of the Robinhood Chain board — same data as the
@@ -365,6 +388,12 @@ enum Outcome {
     /// "what's heating up right now", a different question from `Screen`'s
     /// "what's busiest today" even though both draw on the same board.
     ChainHeat { rows: Vec<trending::Row> },
+    /// Which of the wallet's Robinhood Chain holdings are currently on the
+    /// trending board, with each one's live trending data alongside the
+    /// held balance — answers "what am I sitting on that's moving right
+    /// now", a join `wallet_balance` (one token) and `chain_screen` (no
+    /// wallet) can't each answer alone.
+    HoldingsDigest { rows: Vec<DigestRow> },
     /// One Ondo Stock's dividend info — a separate Ondo endpoint from
     /// `Stock`'s market data, explaining *why* the price drifts (dividends
     /// reinvest into the token rather than paying out) rather than what the
@@ -440,6 +469,12 @@ struct PendingConfirm {
     amount: String,
     to: String,
     estimated_fee_native: String,
+    /// The model's plain-language read of the route (`ROUTE_SYSTEM`), when
+    /// an AI key is configured and the call succeeded. `None` for the
+    /// approval leg of a swap (nothing route-shaped to say about it) and
+    /// whenever narration fails — silently absent, never an error shown on
+    /// a confirmation screen.
+    route_note: Option<String>,
     reply: std::sync::mpsc::SyncSender<bool>,
 }
 
@@ -452,6 +487,37 @@ impl Outcome {
             tokens::format_units(quote.amount_out, quote.token_out.decimals),
         )
     }
+}
+
+/// "ETH → USDC → DAI (2 hops)" — the free half of route x-ray: no network
+/// call, no model, just what `route_hops` already carries. `None` for a
+/// direct pair, where there's nothing worth saying.
+fn route_path_words(token_in: &str, token_out: &str, hops: &[api::QuoteToken]) -> Option<String> {
+    if hops.is_empty() {
+        return None;
+    }
+    let path = std::iter::once(token_in)
+        .chain(hops.iter().map(|h| h.symbol.as_str()))
+        .chain(std::iter::once(token_out))
+        .collect::<Vec<_>>()
+        .join(" \u{2192} ");
+    Some(format!("{path} ({} hops)", hops.len() + 1))
+}
+
+/// Numeric brief fed to `ROUTE_SYSTEM` — the model narrates only what's in
+/// here, nothing it wasn't given.
+fn route_brief(token_in: &str, token_out: &str, hops: &[api::QuoteToken], price_impact: Option<f64>) -> String {
+    let path = std::iter::once(token_in)
+        .chain(hops.iter().map(|h| h.symbol.as_str()))
+        .chain(std::iter::once(token_out))
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    format!(
+        "path: {path} ({} hop{})\nprice impact: {}",
+        hops.len() + 1,
+        if hops.len() + 1 == 1 { "" } else { "s" },
+        price_impact.map(|p| format!("{:.3}%", p * 100.0)).unwrap_or_else(|| "unknown".into()),
+    )
 }
 
 /// A written line for the turn, not just a data card underneath it — this is
@@ -469,11 +535,16 @@ fn chat_reply(outcome: &Outcome) -> String {
         Outcome::Price { chain, symbol, usd, .. } => {
             format!("{symbol} is at {} on {chain}.", market::money_price(*usd))
         }
-        Outcome::Quote { chain, quote } => {
+        Outcome::Quote { chain, quote, .. } => {
             let (sent, got) = Outcome::legs(quote);
+            let hop_note = match quote.route_hops.len() {
+                0 => String::new(),
+                1 => format!(" (via {})", quote.route_hops[0].symbol),
+                _ => format!(" ({} hops)", quote.hop_count()),
+            };
             match quote.status.as_str() {
                 "Success" => format!(
-                    "{sent} {} gets you about {got} {} on {chain}.",
+                    "{sent} {} gets you about {got} {}{hop_note} on {chain}.",
                     quote.token_in.symbol, quote.token_out.symbol
                 ),
                 "Partial" => format!(
@@ -515,6 +586,16 @@ fn chat_reply(outcome: &Outcome) -> String {
                 top.symbol,
             ),
             None => "Nothing on Robinhood Chain has a usable volume reading right now.".to_string(),
+        },
+        Outcome::HoldingsDigest { rows } => match rows.first() {
+            Some(top) => format!(
+                "{} of your holdings {} currently trending on Robinhood Chain — {} leads at {}.",
+                rows.len(),
+                if rows.len() == 1 { "is" } else { "are" },
+                top.row.symbol,
+                market::money_price(top.row.price_usd),
+            ),
+            None => "None of your holdings are currently on the trending board.".to_string(),
         },
         Outcome::Dividend { ticker, yield_frac, payout_frequency, last_cash_amount, .. } => {
             match (yield_frac, payout_frequency.as_deref()) {
@@ -665,6 +746,17 @@ pub struct SushiTool {
     /// out the debounce before firing.
     preview_dirty_since: Option<Instant>,
 
+    /// A real slippage curve (1x/10x/100x) for the current preview, fetched
+    /// only once the base 1x quote already shows some impact — cheap swaps
+    /// never pay for the extra two calls. `None` while unfetched, not yet
+    /// worth fetching, or the extra calls failed; `token_card` falls back to
+    /// the old flat-threshold read in every one of those cases.
+    guardian: Option<guardian::Reading>,
+    guardian_rx: Option<Receiver<guardian::Reading>>,
+    /// Mirrors `preview_key` — invalidated at the same point, so a stale
+    /// reading can never outlive the quote it was graded against.
+    guardian_key: Option<(String, String, String)>,
+
     /// What the connected wallet actually holds among the curated tokens —
     /// candidates for the swap card's "from" picker. Empty until
     /// `scan_wallet_holdings` answers; re-scanned when the wallet address
@@ -731,6 +823,10 @@ impl Default for SushiTool {
             preview_rx: None,
             preview_key: None,
             preview_dirty_since: None,
+
+            guardian: None,
+            guardian_rx: None,
+            guardian_key: None,
 
             holdings: Vec::new(),
             holdings_rx: None,
@@ -838,7 +934,21 @@ fn run(intent: Intent, api_key: &str, ai_key: &str, ondo_key: &str) -> Result<Ou
                 },
                 api_key,
             )?;
-            Ok(Outcome::Quote { chain: chain.name, quote })
+            let route_note = if ai_key.trim().is_empty() {
+                String::new()
+            } else {
+                use crate::llm::LlmProvider;
+                let brief = route_brief(
+                    &quote.token_in.symbol,
+                    &quote.token_out.symbol,
+                    &quote.route_hops,
+                    quote.price_impact,
+                );
+                crate::llm::Anthropic::new(ai_key.to_string())
+                    .complete(ROUTE_SYSTEM, &brief)
+                    .unwrap_or_else(|e| format!("(no read: {e})"))
+            };
+            Ok(Outcome::Quote { chain: chain.name, quote, route_note })
         }
         Intent::StockLookup { ticker } => {
             let m = ondo::market(&ticker, ondo_key)?;
@@ -1092,6 +1202,17 @@ fn agent_tools() -> Vec<crate::llm::ToolSpec> {
                 }
             }),
         },
+        crate::llm::ToolSpec {
+            name: "holdings_digest",
+            description: "Which of the imported wallet's Robinhood Chain holdings are \
+                CURRENTLY on the trending board, with each one's live price, volume and \
+                liquidity alongside the held balance — the tool for \"what am I holding that's \
+                moving\", \"anything in my bag that's hot right now\". Scans the whole wallet, \
+                takes no arguments. A held token that isn't currently trending just doesn't \
+                appear in the result — that's not an error. Fails cleanly if no wallet is \
+                imported yet.",
+            input_schema: json!({ "type": "object", "properties": {} }),
+        },
     ]
 }
 
@@ -1118,10 +1239,14 @@ fn tool_result_text(outcome: &Outcome) -> String {
         Outcome::Price { chain, symbol, address, usd } => {
             format!("{symbol} on {chain} ({address}) = {}", market::money_price(*usd))
         }
-        Outcome::Quote { chain, quote } => {
+        Outcome::Quote { chain, quote, route_note } => {
             let (sent, got) = Outcome::legs(quote);
+            let route = route_path_words(&quote.token_in.symbol, &quote.token_out.symbol, &quote.route_hops)
+                .map(|p| format!(" [route: {p}]"))
+                .unwrap_or_default();
+            let note = if route_note.is_empty() { String::new() } else { format!(" — {route_note}") };
             format!(
-                "{sent} {} -> {got} {} on {chain} (status: {})",
+                "{sent} {} -> {got} {} on {chain} (status: {}){route}{note}",
                 quote.token_in.symbol,
                 quote.token_out.symbol,
                 quote.status,
@@ -1192,6 +1317,27 @@ fn tool_result_text(outcome: &Outcome) -> String {
                     "- {} · {} · {heat} · {pressure} · {vol_liq}\n",
                     r.symbol,
                     market::money_price(r.price_usd),
+                ));
+            }
+            out
+        }
+        Outcome::HoldingsDigest { rows } if rows.is_empty() => {
+            "None of the wallet's holdings are currently on the Robinhood Chain trending board."
+                .to_string()
+        }
+        Outcome::HoldingsDigest { rows } => {
+            let mut out = String::from(
+                "Wallet holdings that are currently on the Robinhood Chain trending board, \
+                 busiest first:\n",
+            );
+            for d in rows {
+                let chg = d.row.change_h24.map(|c| format!("{c:+.2}%")).unwrap_or_else(|| "n/a".into());
+                out.push_str(&format!(
+                    "- {} · holding {} · {} · 24h {chg} · liquidity {}\n",
+                    d.row.symbol,
+                    market::token_amount(&d.balance),
+                    market::money_price(d.row.price_usd),
+                    market::money_compact(d.row.liquidity_usd),
                 ));
             }
             out
@@ -1282,10 +1428,12 @@ fn wallet_balance_text(wallet: Option<&str>, ticker: &str) -> String {
 /// already a background thread, so blocking here on the human's answer to
 /// the confirmation panel is exactly the pattern `run_swap` already uses,
 /// just reached from a different door.
+#[allow(clippy::too_many_arguments)]
 fn execute_swap_text(
     input: &serde_json::Value,
     wallet: Option<&str>,
     api_key: &str,
+    ai_key: &str,
     busy: bool,
     pending: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
     swap_step: std::sync::Arc<std::sync::Mutex<SwapStep>>,
@@ -1329,6 +1477,7 @@ fn execute_swap_text(
         amount_raw,
         sender,
         api_key,
+        ai_key,
         info.symbol.clone(),
         set,
         pending,
@@ -1385,6 +1534,38 @@ fn scan_wallet_holdings(owner: &str) -> Vec<Holding> {
         .collect()
 }
 
+/// One held token that's also on the trending board right now — a
+/// `holdings_digest` row. `row` is the untouched trending data (same shape
+/// `chain_screen`/`ChainHeat` already render), `balance` is the held amount
+/// formatted for display.
+struct DigestRow {
+    balance: String,
+    row: trending::Row,
+}
+
+/// Joins what the wallet holds against what's trending right now, by
+/// address — a held token that's simply not on the trending board isn't an
+/// error, it just doesn't make the list. Sorted by 24h volume, busiest
+/// first, same "top of the list is the answer" shape as `Market`/`ChainHeat`.
+fn holdings_digest(owner: &str) -> Result<Outcome, String> {
+    let holdings = scan_wallet_holdings(owner);
+    if holdings.is_empty() {
+        return Ok(Outcome::HoldingsDigest { rows: Vec::new() });
+    }
+    let trending_rows = trending::fetch(intent::SCREEN_LIMIT_MAX, trending::Window::H24)?;
+    let mut rows: Vec<DigestRow> = holdings
+        .into_iter()
+        .filter_map(|h| {
+            trending_rows.iter().find(|r| r.address.eq_ignore_ascii_case(h.address)).map(|r| DigestRow {
+                balance: tokens::format_units(h.balance_raw, h.decimals),
+                row: r.clone(),
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| b.row.volume_h24.partial_cmp(&a.row.volume_h24).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(Outcome::HoldingsDigest { rows })
+}
+
 /// Resolves the swap's chosen source symbol to an (address, decimals) pair —
 /// native ETH as a special case `Chain::token` can never answer, since
 /// Robinhood Chain's curated list has no entry for it (see
@@ -1403,6 +1584,7 @@ fn dispatch_tool(
     input: &serde_json::Value,
     api_key: &str,
     ondo_key: &str,
+    ai_key: &str,
     wallet: Option<&str>,
     swap_busy: bool,
     pending_confirm: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
@@ -1413,7 +1595,7 @@ fn dispatch_tool(
         return wallet_balance_text(wallet, input["ticker"].as_str().unwrap_or(""));
     }
     if name == "execute_swap" {
-        return execute_swap_text(input, wallet, api_key, swap_busy, pending_confirm, swap_step);
+        return execute_swap_text(input, wallet, api_key, ai_key, swap_busy, pending_confirm, swap_step);
     }
     let result: Result<Outcome, String> = match name {
         "market_overview" => {
@@ -1443,7 +1625,7 @@ fn dispatch_tool(
             let token = intent::token_of(chain, input, "token")?;
             run(Intent::Price { chain, token }, api_key, "", "")
         })(),
-        "get_quote" => intent::quote_of(input).and_then(|i| run(i, api_key, "", "")),
+        "get_quote" => intent::quote_of(input).and_then(|i| run(i, api_key, ai_key, "")),
         "lookup_stock" => {
             let ticker = input["ticker"].as_str().unwrap_or_default().trim().to_string();
             if ticker.is_empty() {
@@ -1466,6 +1648,10 @@ fn dispatch_tool(
             rows.truncate(limit);
             Ok(Outcome::StockScreen { rows })
         }
+        "holdings_digest" => match wallet {
+            None => Err("no wallet imported yet — the user needs to click \"Import wallet\" first".to_string()),
+            Some(owner) => holdings_digest(owner),
+        },
         other => Err(format!("unknown tool {other}")),
     };
     match result {
@@ -1501,6 +1687,7 @@ fn run_local_swap_job(
     amount_in: u128,
     sender: &str,
     api_key: &str,
+    ai_key: &str,
     symbol: String,
     set_step: impl Fn(SwapStep),
     pending: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
@@ -1517,6 +1704,17 @@ fn run_local_swap_job(
         },
         api_key,
     )?;
+
+    // A failed narration must never surface as an error on a screen where
+    // the user is about to sign something — `.ok()`, not `.unwrap_or_else`.
+    let route_note = if ai_key.trim().is_empty() {
+        None
+    } else {
+        use crate::llm::LlmProvider;
+        let brief =
+            route_brief(&swap.token_in.symbol, &swap.token_out.symbol, &swap.route_hops, swap.price_impact);
+        crate::llm::Anthropic::new(ai_key.to_string()).complete(ROUTE_SYSTEM, &brief).ok()
+    };
 
     let is_native = token_in.eq_ignore_ascii_case(tokens::NATIVE);
     if !is_native {
@@ -1536,6 +1734,7 @@ fn run_local_swap_job(
                 0,
                 "Approve token spending",
                 format!("infinite {} allowance", swap.token_in.symbol),
+                None,
                 &pending,
             )?;
             set_step(SwapStep::ConfirmingApproval);
@@ -1557,6 +1756,7 @@ fn run_local_swap_job(
         swap.tx.value,
         "Swap",
         amount_display,
+        route_note,
         &pending,
     )?;
 
@@ -1584,6 +1784,7 @@ fn local_send_transaction(
     value: u128,
     label: &'static str,
     amount_display: String,
+    route_note: Option<String>,
     pending: &std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
 ) -> Result<String, String> {
     let nonce = chain_rpc::nonce(chain_id, from)?;
@@ -1597,6 +1798,7 @@ fn local_send_transaction(
         amount: amount_display,
         to: to.to_string(),
         estimated_fee_native: format!("~{fee_native:.6} ETH"),
+        route_note,
         reply: reply_tx,
     });
 
@@ -1718,6 +1920,7 @@ impl SushiTool {
         let chain_id = robinhood.id;
         let token_in = source_address.to_string();
         let api_key = self.sushi_key.clone();
+        let ai_key = self.ai_key.clone();
         let step = self.swap_step.clone();
         let set = move |s: SwapStep| *step.lock().unwrap() = s;
         let pending = self.pending_confirm.clone();
@@ -1731,6 +1934,7 @@ impl SushiTool {
                 amount_raw,
                 &sender,
                 &api_key,
+                &ai_key,
                 symbol,
                 set,
                 pending,
@@ -1753,10 +1957,17 @@ impl SushiTool {
         let snapshot = {
             let guard = self.pending_confirm.lock().unwrap();
             guard.as_ref().map(|p| {
-                (p.label, p.amount.clone(), p.to.clone(), p.estimated_fee_native.clone(), p.reply.clone())
+                (
+                    p.label,
+                    p.amount.clone(),
+                    p.to.clone(),
+                    p.estimated_fee_native.clone(),
+                    p.route_note.clone(),
+                    p.reply.clone(),
+                )
             })
         };
-        let Some((label, amount, to, fee, reply)) = snapshot else { return };
+        let Some((label, amount, to, fee, route_note, reply)) = snapshot else { return };
 
         let mut decision: Option<bool> = None;
         egui::Modal::new(egui::Id::new("sushi_local_confirm")).show(ctx, |ui| {
@@ -1775,6 +1986,10 @@ impl SushiTool {
                     row(ui, "Amount", &amount);
                     row(ui, "To", &short_addr(&to));
                     row(ui, "Est. network fee", &fee);
+                    if let Some(note) = &route_note {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(note).color(FAINT).small().italics());
+                    }
                     ui.add_space(14.0);
                     ui.label(
                         RichText::new(
@@ -1816,6 +2031,9 @@ impl SushiTool {
             self.preview_err = None;
             self.preview_rx = None;
             self.preview_dirty_since = Some(Instant::now());
+            self.guardian = None;
+            self.guardian_rx = None;
+            self.guardian_key = None;
         }
         if self.preview_rx.is_some() || self.preview.is_some() || self.preview_err.is_some() {
             return;
@@ -1942,6 +2160,7 @@ impl SushiTool {
             // Sonnet, not the default Haiku: this agent has to reliably call a
             // tool for every number rather than answer from memory, and Haiku
             // was caught doing exactly that (a guessed ETH/USD conversion).
+            let ai_key_for_tools = ai_key.clone();
             let anthropic = crate::llm::Anthropic::new(ai_key).with_model("claude-sonnet-5");
             let tools = agent_tools();
             let mut guard = messages.lock().unwrap();
@@ -1953,6 +2172,7 @@ impl SushiTool {
                     input,
                     &api_key,
                     &ondo_key,
+                    &ai_key_for_tools,
                     wallet.as_deref(),
                     swap_busy,
                     pending_confirm.clone(),
@@ -1970,7 +2190,7 @@ impl SushiTool {
             Ok(Outcome::Price { chain, symbol, usd, .. }) => {
                 (format!("{symbol} on {chain} = ${usd}"), true)
             }
-            Ok(Outcome::Quote { chain, quote }) => {
+            Ok(Outcome::Quote { chain, quote, .. }) => {
                 let (sent, got) = Outcome::legs(quote);
                 (
                     format!(
@@ -1995,6 +2215,9 @@ impl SushiTool {
             }
             Ok(Outcome::ChainHeat { rows }) => {
                 (format!("screened {} Robinhood Chain tokens by heat", rows.len()), true)
+            }
+            Ok(Outcome::HoldingsDigest { rows }) => {
+                (format!("found {} held token(s) currently trending", rows.len()), true)
             }
             Ok(Outcome::Dividend { ticker, .. }) => (format!("read {ticker}'s dividend info"), true),
             Ok(Outcome::Chat { card, .. }) => (
@@ -2127,6 +2350,7 @@ impl SushiTool {
         if let Some(rx) = &self.preview_rx {
             match rx.try_recv() {
                 Ok(Ok(q)) => {
+                    self.maybe_start_guardian(&q, ui.ctx());
                     self.preview = Some(q);
                     self.preview_err = None;
                     self.preview_rx = None;
@@ -2140,6 +2364,73 @@ impl SushiTool {
                 Err(TryRecvError::Disconnected) => self.preview_rx = None,
             }
         }
+        if let Some(rx) = &self.guardian_rx {
+            match rx.try_recv() {
+                Ok(reading) => {
+                    self.guardian = Some(reading);
+                    self.guardian_rx = None;
+                }
+                Err(TryRecvError::Empty) => ui.ctx().request_repaint(),
+                // A failed/aborted guardian thread just leaves `guardian`
+                // `None` — `token_card` already treats that as "fall back
+                // to the flat threshold", not an error to surface.
+                Err(TryRecvError::Disconnected) => self.guardian_rx = None,
+            }
+        }
+    }
+
+    /// Fires the two extra `/quote` calls (10x, 100x) only once the base 1x
+    /// quote already shows some impact — a clean swap never pays for the
+    /// curve check. Reuses the 1x impact already in hand rather than a third
+    /// redundant call for it.
+    fn maybe_start_guardian(&mut self, q: &api::Quote, ctx: &egui::Context) {
+        const GUARDIAN_FLOOR: f64 = 0.005;
+        let impact_1x = q.price_impact;
+        if impact_1x.map(f64::abs).unwrap_or(0.0) <= GUARDIAN_FLOOR {
+            return;
+        }
+        let Some(key) = self.preview_key.clone() else { return };
+        if self.guardian_key.as_ref() == Some(&key) {
+            return; // already fetched (or fetching) a reading for this exact quote
+        }
+        let Some(robinhood) = tokens::chain_by_name(trending::CHAIN_NAME) else { return };
+        let amount_1x = q.amount_in;
+        let chain_id = robinhood.id;
+        let token_in = q.token_in.address.clone();
+        let token_out = q.token_out.address.clone();
+        let api_key = self.sushi_key.clone();
+
+        self.guardian = None;
+        self.guardian_key = Some(key);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let leg = |mult: u128| -> Option<f64> {
+                let amount = amount_1x.checked_mul(mult)?;
+                api::quote(
+                    &api::QuoteRequest {
+                        chain_id,
+                        token_in: token_in.clone(),
+                        token_out: token_out.clone(),
+                        amount,
+                        max_slippage: DEFAULT_SLIPPAGE,
+                    },
+                    &api_key,
+                )
+                .ok()?
+                .price_impact
+            };
+            let impact_10x = leg(10);
+            let impact_100x = leg(100);
+            let reading = guardian::Reading {
+                grade: guardian::grade(impact_1x, impact_10x, impact_100x),
+                impact_1x,
+                impact_10x,
+                impact_100x,
+            };
+            let _ = tx.send(reading);
+        });
+        self.guardian_rx = Some(rx);
+        ctx.request_repaint();
     }
 
     /// What is launching and trading on Robinhood Chain, busiest first.
@@ -2518,6 +2809,7 @@ impl SushiTool {
                     self.preview.as_ref(),
                     self.preview_err.as_deref().filter(|e| !e.is_empty()),
                     self.preview_rx.is_some(),
+                    self.guardian.as_ref(),
                     true,
                     &self.holdings,
                     &mut self.source_symbol,
@@ -2607,6 +2899,7 @@ impl SushiTool {
                             self.preview.as_ref(),
                             self.preview_err.as_deref().filter(|e| !e.is_empty()),
                             self.preview_rx.is_some(),
+                            self.guardian.as_ref(),
                             interactive,
                             &self.holdings,
                             &mut self.source_symbol,
@@ -3531,6 +3824,7 @@ fn as_stock_outcome(outcome: &Outcome) -> Option<&Outcome> {
 /// unwraps to whatever it's carrying, and everything else goes through the
 /// generic, non-interactive `result_card_inner`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn render_outcome(
     ui: &mut egui::Ui,
     outcome: &Outcome,
@@ -3542,6 +3836,7 @@ fn render_outcome(
     preview: Option<&api::Quote>,
     preview_err: Option<&str>,
     preview_loading: bool,
+    guardian: Option<&guardian::Reading>,
     interactive: bool,
     holdings: &[Holding],
     source_symbol: &mut String,
@@ -3559,6 +3854,7 @@ fn render_outcome(
             preview,
             preview_err,
             preview_loading,
+            guardian,
             interactive,
             holdings,
             source_symbol,
@@ -3574,6 +3870,7 @@ fn render_outcome(
             preview,
             preview_err,
             preview_loading,
+            guardian,
             interactive,
             holdings,
             source_symbol,
@@ -3586,6 +3883,7 @@ fn render_outcome(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn token_card(
     ui: &mut egui::Ui,
     info: &trending::Info,
@@ -3598,6 +3896,7 @@ fn token_card(
     preview: Option<&api::Quote>,
     preview_err: Option<&str>,
     preview_loading: bool,
+    guardian: Option<&guardian::Reading>,
     interactive: bool,
     holdings: &[Holding],
     source_symbol: &mut String,
@@ -3784,7 +4083,18 @@ fn token_card(
             } else if let Some(q) = preview {
                 let (_, got) = Outcome::legs(q);
                 let impact = q.price_impact.unwrap_or(0.0);
-                let hot = impact.abs() > 0.03;
+                // Graded on the real 1x/10x/100x curve when the guardian has
+                // one; falls straight back to the old flat 3% read whenever
+                // it hasn't fired (below its floor), hasn't landed yet, or
+                // failed — never a missing or broken state, just the
+                // pre-guardian behavior.
+                let (hot, warning) = match guardian {
+                    Some(g) => (g.grade != guardian::Grade::Fine, Some(g.message())),
+                    None if impact.abs() > 0.03 => {
+                        (true, Some("thin pool — that's a real haircut, maybe size down"))
+                    }
+                    None => (false, None),
+                };
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!(
@@ -3803,6 +4113,11 @@ fn token_card(
                         );
                     }
                 });
+                if let Some(route) =
+                    route_path_words(&q.token_in.symbol, &q.token_out.symbol, &q.route_hops)
+                {
+                    ui.label(RichText::new(route).color(FAINT).small());
+                }
                 // The number above is the router's own output amount, not a
                 // separate price call — this is that same amount times the
                 // token's already-fetched spot price, so it can't drift from
@@ -3816,12 +4131,8 @@ fn token_card(
                         );
                     }
                 }
-                if hot {
-                    ui.label(
-                        RichText::new("thin pool — that's a real haircut, maybe size down")
-                            .color(RED)
-                            .small(),
-                    );
+                if let Some(warning) = warning {
+                    ui.label(RichText::new(warning).color(RED).small());
                 }
             } else if let Some(e) = preview_err {
                 ui.label(RichText::new(format!("no route — {e}")).color(FAINT).small());
@@ -3928,7 +4239,7 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
             );
             ui.label(RichText::new(address).color(FAINT).font(FontId::monospace(11.0)));
         }
-        Outcome::Quote { chain, quote } => {
+        Outcome::Quote { chain, quote, route_note } => {
             let (sent, got) = Outcome::legs(quote);
             ui.horizontal(|ui| {
                 let (label, color) = match quote.status.as_str() {
@@ -3955,6 +4266,11 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                 let color = if pct.abs() >= 1.0 { RED } else { DIM };
                 ui.label(RichText::new(format!("price impact {pct:.3}%")).color(color).small());
             }
+            if let Some(route) =
+                route_path_words(&quote.token_in.symbol, &quote.token_out.symbol, &quote.route_hops)
+            {
+                ui.label(RichText::new(route).color(DIM).small());
+            }
             if let Some(p) = quote.unit_price() {
                 ui.label(
                     RichText::new(format!(
@@ -3966,6 +4282,10 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                     .color(DIM)
                     .small(),
                 );
+            }
+            if !route_note.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(route_note).color(FAINT).small().italics());
             }
             ui.add_space(4.0);
             ui.label(
@@ -4104,6 +4424,49 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                                 .small(),
                         );
                     }
+                });
+            }
+        }
+        Outcome::HoldingsDigest { rows } => {
+            ui.label(
+                RichText::new("YOUR HOLDINGS · currently trending").color(ACCENT).small().strong(),
+            );
+            ui.add_space(6.0);
+            if rows.is_empty() {
+                ui.label(
+                    RichText::new("none of your holdings are on the trending board right now")
+                        .color(FAINT)
+                        .small(),
+                );
+            }
+            for d in rows {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(&d.row.symbol)
+                            .color(FG)
+                            .font(FontId::monospace(13.5))
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new(format!("holding {}", market::token_amount(&d.balance)))
+                            .color(DIM)
+                            .small(),
+                    );
+                    ui.label(
+                        RichText::new(market::money_price(d.row.price_usd))
+                            .color(DIM)
+                            .font(FontId::monospace(12.5)),
+                    );
+                    if let Some(c) = d.row.change_h24 {
+                        ui.label(
+                            RichText::new(format!("{c:+.2}% 24h")).color(if c >= 0.0 { UP } else { RED }).small(),
+                        );
+                    }
+                    ui.label(
+                        RichText::new(format!("liq {}", market::money_compact(d.row.liquidity_usd)))
+                            .color(FAINT)
+                            .small(),
+                    );
                 });
             }
         }

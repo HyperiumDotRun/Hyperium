@@ -49,6 +49,7 @@ const QUOTES: &[&str] = &["WETH", "USDG", "VIRTUAL"];
 /// bare client failed.
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Hyperium";
 
+#[derive(Clone)]
 pub struct Row {
     pub symbol: String,
     pub address: String,
