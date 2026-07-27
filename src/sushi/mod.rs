@@ -4726,6 +4726,19 @@ fn token_card(
     action
 }
 
+/// Robinhood Chain testnet's own Blockscout explorer — the bonding-curve
+/// cards below link straight into it (an address or a tx) rather than just
+/// printing the hex, since there's nowhere else in this app to look one up.
+const TESTNET_EXPLORER: &str = "https://explorer.testnet.chain.robinhood.com";
+
+fn testnet_explorer_address_url(addr: &str) -> String {
+    format!("{TESTNET_EXPLORER}/address/{addr}")
+}
+
+fn testnet_explorer_tx_url(hash: &str) -> String {
+    format!("{TESTNET_EXPLORER}/tx/{hash}")
+}
+
 /// Content only, no frame of its own — the caller (`assistant_bubble`)
 /// already supplies the card, so this would otherwise double up.
 fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
@@ -5066,12 +5079,21 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
             ui.label(RichText::new(token_name).color(DIM).small());
             ui.add_space(6.0);
             ui.label(RichText::new(format!("paired with {paired_symbol}")).color(FAINT).small());
-            ui.label(
-                RichText::new(format!("curve: {curve_address}"))
-                    .color(ACCENT)
-                    .font(FontId::monospace(11.0)),
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("curve: {curve_address}"))
+                        .color(ACCENT)
+                        .font(FontId::monospace(11.0)),
+                );
+                ui.hyperlink_to(
+                    RichText::new("view on explorer ↗").color(ACCENT).small(),
+                    testnet_explorer_address_url(curve_address),
+                );
+            });
+            ui.hyperlink_to(
+                RichText::new(format!("tx {tx_hash} ↗")).color(FAINT).font(FontId::monospace(11.0)),
+                testnet_explorer_tx_url(tx_hash),
             );
-            ui.label(RichText::new(format!("tx {tx_hash}")).color(FAINT).font(FontId::monospace(11.0)));
         }
         Outcome::CurveBuy { curve_address, paired_symbol, stock_in, min_tokens_out, tx_hash } => {
             ui.horizontal(|ui| {
@@ -5084,8 +5106,17 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                     .color(DIM)
                     .small(),
             );
-            ui.label(RichText::new(format!("curve: {curve_address}")).color(FAINT).font(FontId::monospace(11.0)));
-            ui.label(RichText::new(format!("tx {tx_hash}")).color(FAINT).font(FontId::monospace(11.0)));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("curve: {curve_address}")).color(FAINT).font(FontId::monospace(11.0)));
+                ui.hyperlink_to(
+                    RichText::new("view ↗").color(ACCENT).small(),
+                    testnet_explorer_address_url(curve_address),
+                );
+            });
+            ui.hyperlink_to(
+                RichText::new(format!("tx {tx_hash} ↗")).color(FAINT).font(FontId::monospace(11.0)),
+                testnet_explorer_tx_url(tx_hash),
+            );
         }
         Outcome::CurveStatus {
             curve_address,
@@ -5127,9 +5158,21 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                 );
             }
             if let Some(pool) = pool_address {
-                ui.label(RichText::new(format!("pool: {pool}")).color(ACCENT).font(FontId::monospace(11.0)));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("pool: {pool}")).color(ACCENT).font(FontId::monospace(11.0)));
+                    ui.hyperlink_to(
+                        RichText::new("view ↗").color(ACCENT).small(),
+                        testnet_explorer_address_url(pool),
+                    );
+                });
             }
-            ui.label(RichText::new(format!("curve: {curve_address}")).color(FAINT).font(FontId::monospace(11.0)));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("curve: {curve_address}")).color(FAINT).font(FontId::monospace(11.0)));
+                ui.hyperlink_to(
+                    RichText::new("view ↗").color(ACCENT).small(),
+                    testnet_explorer_address_url(curve_address),
+                );
+            });
         }
     }
 }
