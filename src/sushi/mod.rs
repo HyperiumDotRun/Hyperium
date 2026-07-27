@@ -96,6 +96,22 @@ const EXAMPLES: &[Example] = &[
     },
 ];
 
+/// Only shown once the bonding-curve feature is switched on in settings —
+/// otherwise clicking it would just error, and the chip row should never
+/// advertise a tool that can't actually run. This is the fix for the gap
+/// where the feature was reachable only by finding it in the settings
+/// panel first: same "try" row every other capability gets discovered
+/// through.
+const BONDING_EXAMPLE: Example = Example {
+    text: "launch a token paired with TSLA (testnet)",
+    hint: Some(
+        "Experimental, Robinhood Chain TESTNET only — creates a new token whose \
+         bonding-curve liquidity is a test stock token instead of ETH/USDC (the \
+         longdotxyz idea). No real money. Once it exists, ask to buy on it or check \
+         its status too.",
+    ),
+};
+
 /// Phrases cycled while a request is in flight. They name the step actually
 /// under way, so the wait reads as work rather than as a hang.
 const THINKING: &[&str] =
@@ -3565,7 +3581,8 @@ impl SushiTool {
         // vanishing the moment it might actually be useful.
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("try").color(FAINT).small());
-            for ex in EXAMPLES {
+            let bonding_chip = self.bonding.use_testnet.then_some(&BONDING_EXAMPLE);
+            for ex in EXAMPLES.iter().chain(bonding_chip) {
                 let ready = has_ai && !busy;
                 let clicked = match ex.hint {
                     Some(h) => tool_button_hint(ui, ex.text, ready, h),
