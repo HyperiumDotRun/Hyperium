@@ -5,8 +5,9 @@
 //! crate for two four-byte constants would be a dependency for a fact that
 //! never changes.
 
-/// Left-pads a 20-byte address into a 32-byte ABI word.
-fn pad_address(addr: &str) -> Result<String, String> {
+/// Left-pads a 20-byte address into a 32-byte ABI word. `pub(super)`: also
+/// reused by `bonding.rs` for the same padding rule, rather than duplicating it.
+pub(super) fn pad_address(addr: &str) -> Result<String, String> {
     let a = addr.trim().trim_start_matches("0x");
     if a.len() != 40 || !a.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("not a valid address: {addr}"));
@@ -14,7 +15,7 @@ fn pad_address(addr: &str) -> Result<String, String> {
     Ok(format!("{:0>64}", a.to_ascii_lowercase()))
 }
 
-fn pad_u128(v: u128) -> String {
+pub(super) fn pad_u128(v: u128) -> String {
     format!("{v:064x}")
 }
 

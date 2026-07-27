@@ -143,6 +143,50 @@ pub const CHAINS: &[Chain] = &[
             },
         ],
     },
+    // Robinhood Chain testnet. Only exists for the bonding-curve launch
+    // feature (`bonding.rs`) to be tested against real test stock tokens
+    // before any mainnet deploy — not reachable through price/quote, since
+    // Sushi's aggregator and Dexscreener don't index this chain. Addresses
+    // verified live on-chain: the testnet's Blockscout indexer turned out to
+    // carry stale entries from a prior testnet reset (picking the
+    // highest-holder-count deployment per symbol still landed on a dead
+    // one), so these were instead confirmed by reading the actual
+    // `Transfer` event log the official faucet
+    // (faucet.testnet.chain.robinhood.com) emitted when it funded this
+    // project's own throwaway test wallet, then reading each token's
+    // `symbol()` back to label them — the only way to be sure a given
+    // address is the one the faucet (and thus most testers) actually use.
+    Chain {
+        id: 46630,
+        name: "Robinhood Testnet",
+        tokens: &[
+            Token {
+                symbol: "TSLA",
+                address: "0xc9f9c86933092bbbfff3ccb4b105a4a94bf3bd4e",
+                decimals: 18,
+            },
+            Token {
+                symbol: "AMD",
+                address: "0x71178bac73cbeb415514eb542a8995b82669778d",
+                decimals: 18,
+            },
+            Token {
+                symbol: "NFLX",
+                address: "0x3b8262a63d25f0477c4dde23f83cfe22cb768c93",
+                decimals: 18,
+            },
+            Token {
+                symbol: "PLTR",
+                address: "0x1fbe1a0e43594b3455993b5de5fd0a7a266298d0",
+                decimals: 18,
+            },
+            Token {
+                symbol: "AMZN",
+                address: "0x5884ad2f920c162cfbbacc88c9c51aa75ec09e02",
+                decimals: 18,
+            },
+        ],
+    },
     Chain {
         id: 1,
         name: "Ethereum",

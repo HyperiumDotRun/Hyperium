@@ -10,6 +10,7 @@
 //! leaves this machine.
 
 mod api;
+mod bonding;
 mod chain_rpc;
 mod erc20;
 mod guardian;
@@ -194,7 +195,20 @@ safe. Describe the route, not the decision.";
 /// real chat, tool calls when a question needs real numbers, same degen
 /// voice, same hard limits (no invented numbers, no buy/sell calls, no
 /// pretending it can sign anything itself).
-fn agent_system_prompt() -> String {
+fn agent_system_prompt(bonding_enabled: bool) -> String {
+    let bonding_paragraph = if bonding_enabled {
+        "\n\nA separate, experimental, TESTNET-ONLY feature is also on: launch_token, \
+         buy_on_curve and curve_status let someone launch a brand-new token whose bonding-curve \
+         liquidity is a Robinhood Chain TESTNET stock token instead of ETH/USDC (the longdotxyz \
+         idea), buy on it, and check how close it is to graduating into a pool. This is \
+         completely separate from execute_swap/lookup_token's real Robinhood Chain (mainnet) — \
+         say plainly this is testnet, no real money, whenever it comes up. curve_address (from \
+         launch_token's result) is required for every later buy_on_curve/curve_status call on \
+         that token — never invent or guess one; if it isn't in this conversation already, say \
+         you don't have it rather than making one up."
+    } else {
+        ""
+    };
     format!(
         "You are Hyperium's Sushi agent — a crypto-market chatbot embedded in a desktop app. \
 Talk like a knowledgeable person having a normal conversation, not a press release and not \
@@ -276,7 +290,7 @@ signed — you cannot skip or auto-answer that panel, it's outside this conversa
 purpose, and execute_swap simply waits (or reports back cleanly if it's cancelled or times \
 out after ten minutes). If no wallet is imported yet, \"Import wallet\" is in the bar above \
 the message box — the key is encrypted on this machine and only a short-lived signing \
-process ever touches it, never this chat.",
+process ever touches it, never this chat.{bonding_paragraph}",
         tokens::catalog()
     )
 }
@@ -411,6 +425,41 @@ enum Outcome {
         /// or the lookup itself failed — this stays optional rather than
         /// failing the whole dividend read over it.
         multiplier_growth_1y: Option<f64>,
+    },
+    /// A new bonding-curve token launched via the configured testnet factory
+    /// (Phase C — see `bonding.rs`). `curve_address` is what every later
+    /// `buy_on_curve`/`curve_status` call on this token needs; the model has
+    /// to carry it forward from here rather than guess or reuse a different
+    /// token's — nothing else in this app can look it up after the fact.
+    TokenLaunch {
+        token_symbol: String,
+        token_name: String,
+        paired_symbol: String,
+        curve_address: String,
+        tx_hash: String,
+    },
+    /// A buy against an already-launched curve.
+    CurveBuy {
+        curve_address: String,
+        paired_symbol: String,
+        stock_in: String,
+        min_tokens_out: String,
+        tx_hash: String,
+    },
+    /// A read-only check on a curve: how much of the paired stock token has
+    /// been raised against its graduation threshold, and the pool address
+    /// once it's graduated. `price_per_token`/`progress_pct` are `None` once
+    /// `graduated` — the curve stops pricing trades at that point, spot
+    /// price lives on the pool instead, which this doesn't read.
+    CurveStatus {
+        curve_address: String,
+        paired_symbol: String,
+        raised: String,
+        graduation_threshold: String,
+        graduated: bool,
+        pool_address: Option<String>,
+        price_per_token: Option<f64>,
+        progress_pct: Option<f64>,
     },
 }
 
@@ -609,6 +658,11 @@ fn chat_reply(outcome: &Outcome) -> String {
                 _ => format!("{ticker} doesn't have dividend data on file right now."),
             }
         }
+        // All three carry a full sentence already built by `tool_result_text`
+        // — nothing further to phrase on top of a launch/buy/status read.
+        Outcome::TokenLaunch { .. } | Outcome::CurveBuy { .. } | Outcome::CurveStatus { .. } => {
+            String::new()
+        }
     }
 }
 
@@ -770,6 +824,12 @@ pub struct SushiTool {
     /// the one token every pool on this chain is guaranteed to pair against
     /// — until the user picks something else from their own holdings.
     source_symbol: String,
+
+    /// Bonding-curve launch feature settings (factory address + testnet
+    /// toggle) — loaded/saved like `sushi_key`/`ondo_key` but through
+    /// `bonding::load_config`/`save_config`'s plain flat files, since neither
+    /// value is a secret.
+    bonding: bonding::BondingConfig,
 }
 
 impl Default for SushiTool {
@@ -832,6 +892,8 @@ impl Default for SushiTool {
             holdings_rx: None,
             holdings_for: None,
             source_symbol: "WETH".to_string(),
+
+            bonding: bonding::BondingConfig::default(),
         }
     }
 }
@@ -1002,9 +1064,13 @@ fn run(intent: Intent, api_key: &str, ai_key: &str, ondo_key: &str) -> Result<Ou
 /// The tool set `ask_model` hands to Anthropic. Every schema here is what
 /// actually gets validated on Anthropic's side before `dispatch_tool` ever
 /// sees an `input` — there's no free-text JSON to parse or get subtly wrong.
-fn agent_tools() -> Vec<crate::llm::ToolSpec> {
+/// `bonding_enabled` gates the three testnet-launch tools at the bottom —
+/// offered to the model only once the user has explicitly turned the
+/// feature on in settings, so it never suggests an action that would just
+/// fail (or send a testnet-only tx someone forgot they'd enabled).
+fn agent_tools(bonding_enabled: bool) -> Vec<crate::llm::ToolSpec> {
     use serde_json::json;
-    vec![
+    let mut tools = vec![
         crate::llm::ToolSpec {
             name: "market_overview",
             description: "The whole crypto market (CoinGecko) — what's pumping, biggest \
@@ -1073,7 +1139,11 @@ fn agent_tools() -> Vec<crate::llm::ToolSpec> {
                 buy/sell pressure, pool age, socials. Works for ANY token on this chain, \
                 including ones launched minutes ago. This is also what puts up the swap \
                 card the user can act on, so call it whenever they name a token they \
-                might want to swap into.",
+                might want to swap into. Note for route/path questions on this chain: this \
+                tool itself doesn't return a route — the swap card it opens does, live, once \
+                the user types an amount into it (route path plus a liquidity read at that \
+                size). Tell the user to enter an amount in the card to see it, rather than \
+                saying there's no way to see the route on this chain at all.",
             input_schema: json!({
                 "type": "object",
                 "properties": { "ticker": { "type": "string" } },
@@ -1100,7 +1170,12 @@ fn agent_tools() -> Vec<crate::llm::ToolSpec> {
             description: "Preview exchange rate between two tokens — but ONLY for the same \
                 short curated list as get_price. For Robinhood Chain tokens, use \
                 lookup_token on the token the user wants instead; that surfaces a real \
-                swap card, this tool doesn't.",
+                swap card, this tool doesn't. The result also names the actual route \
+                Sushi's router took — which token(s), if any, it hopped through before \
+                reaching the output, and the price impact of that route. If the user asks \
+                what path/route a swap would take, this is how to answer it: read the route \
+                back from the result rather than saying you have no way to show it. A \
+                direct pair has no hops, which is itself worth saying plainly.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1213,7 +1288,75 @@ fn agent_tools() -> Vec<crate::llm::ToolSpec> {
                 imported yet.",
             input_schema: json!({ "type": "object", "properties": {} }),
         },
-    ]
+    ];
+    if bonding_enabled {
+        tools.extend([
+            crate::llm::ToolSpec {
+                name: "launch_token",
+                description: "TESTNET ONLY, experimental: launch a brand-new token whose \
+                    bonding-curve liquidity is denominated in a Robinhood Chain testnet stock \
+                    token instead of ETH/USDC — the longdotxyz idea. Sends a real testnet \
+                    transaction (no real money — everything here is Robinhood Chain TESTNET, \
+                    say so plainly), through the same confirmation panel as execute_swap. \
+                    paired_stock must be one of the Robinhood Chain testnet stock tokens (ask \
+                    wallet_balance or just try the ticker — TSLA/AMD/NFLX/PLTR/AMZN are the ones \
+                    configured). graduation_threshold is how much of paired_stock must be raised \
+                    before the curve auto-migrates its liquidity into a pool — pick something \
+                    reasonable for a demo (tens to low hundreds), not an enormous number nobody \
+                    will ever reach. The result gives back a curve_address — tell the user to \
+                    save it, since every later buy_on_curve/curve_status call on this token needs \
+                    it and there's no other way to look it up from inside this app.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "the new token's full name" },
+                        "symbol": { "type": "string", "description": "the new token's ticker" },
+                        "paired_stock": { "type": "string", "description": "e.g. \"TSLA\" — must be a Robinhood Chain testnet stock token" },
+                        "graduation_threshold": { "type": "string", "description": "plain decimal amount of paired_stock, e.g. \"500\"" }
+                    },
+                    "required": ["name", "symbol", "paired_stock", "graduation_threshold"]
+                }),
+            },
+            crate::llm::ToolSpec {
+                name: "buy_on_curve",
+                description: "TESTNET ONLY: buy a bonding-curve token launched via launch_token, \
+                    spending the same stock token it's paired with. curve_address must be the \
+                    exact address launch_token (or curve_status) returned for this token — never \
+                    guess one. Approves the stock token to the curve first if needed, then buys, \
+                    both through the same confirmation panel as execute_swap — this sends real \
+                    testnet transactions.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "curve_address": { "type": "string" },
+                        "paired_stock": { "type": "string", "description": "the stock token this curve is paired with, e.g. \"TSLA\"" },
+                        "stock_amount": { "type": "string", "description": "plain decimal amount of the paired stock token to spend, e.g. \"10\"" }
+                    },
+                    "required": ["curve_address", "paired_stock", "stock_amount"]
+                }),
+            },
+            crate::llm::ToolSpec {
+                name: "curve_status",
+                description: "TESTNET ONLY, read-only: the curve's current live price (paired \
+                    stock token per new token, read straight from the contract's own pricing \
+                    function — never estimate this yourself), how much of the paired stock \
+                    token has been raised against its graduation threshold as a percentage, \
+                    whether it's graduated yet, and the pool address once it has. Price and \
+                    progress are only meaningful before graduation — once graduated, trading \
+                    has moved to the pool and this stops pricing new trades. curve_address must \
+                    be an address launch_token already returned this conversation.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "curve_address": { "type": "string" },
+                        "paired_stock": { "type": "string", "description": "the stock token this curve is paired with, e.g. \"TSLA\"" }
+                    },
+                    "required": ["curve_address", "paired_stock"]
+                }),
+            },
+        ]);
+    }
+    tools
 }
 
 /// Flattens an `Outcome` into the text a model reads back as a `tool_result`
@@ -1366,6 +1509,47 @@ fn tool_result_text(outcome: &Outcome) -> String {
                     "{ticker}: no current dividend data on file (either it doesn't pay one, or \
                      Ondo hasn't recorded one for it).{growth}"
                 ),
+            }
+        }
+        Outcome::TokenLaunch { token_symbol, token_name, paired_symbol, curve_address, tx_hash } => {
+            format!(
+                "launched {token_symbol} (\"{token_name}\") on Robinhood Chain testnet, paired \
+                 with {paired_symbol} (tx {tx_hash}). curve_address = {curve_address} — remember \
+                 this exact address, it's required for every buy_on_curve/curve_status call on \
+                 this token from now on."
+            )
+        }
+        Outcome::CurveBuy { curve_address, paired_symbol, stock_in, min_tokens_out, tx_hash } => {
+            format!(
+                "bought on curve {curve_address}: spent {stock_in} {paired_symbol}, minimum \
+                 {min_tokens_out} tokens out after slippage (tx {tx_hash})"
+            )
+        }
+        Outcome::CurveStatus {
+            curve_address,
+            paired_symbol,
+            raised,
+            graduation_threshold,
+            graduated,
+            pool_address,
+            price_per_token,
+            progress_pct,
+        } => {
+            if *graduated {
+                format!(
+                    "curve {curve_address}: graduated — {raised} {paired_symbol} raised (threshold \
+                     was {graduation_threshold}). Trading now happens on the pool at {}.",
+                    pool_address.as_deref().unwrap_or("unknown"),
+                )
+            } else {
+                let price = price_per_token
+                    .map(|p| format!(" — current price ~{} {paired_symbol} per token", fmt_price(p)))
+                    .unwrap_or_default();
+                let pct = progress_pct.map(|p| format!(" ({p:.1}% of the way there)")).unwrap_or_default();
+                format!(
+                    "curve {curve_address}: {raised} of {graduation_threshold} {paired_symbol} \
+                     raised{pct} — not graduated yet, still trading on the curve.{price}"
+                )
             }
         }
     }
@@ -1578,6 +1762,258 @@ fn resolve_source_token(chain: &'static tokens::Chain, symbol: &str) -> Option<(
     chain.token(symbol).map(|t| (t.address, t.decimals))
 }
 
+/// The one chain the whole bonding-curve launch feature targets (Phase C) —
+/// a distinct `tokens.rs` entry from mainnet Robinhood, never reachable
+/// through price/quote/swap.
+fn testnet_chain() -> Result<&'static tokens::Chain, String> {
+    tokens::chain_by_name("Robinhood Testnet")
+        .ok_or_else(|| "Robinhood Chain testnet isn't configured".to_string())
+}
+
+/// The agent's door into launching a bonding-curve token (`launch_token`) —
+/// a state-changing call, so like `execute_swap_text` it goes through
+/// `PendingConfirm`/`local_send_transaction` rather than the generic `run()`
+/// match, and is special-cased in `dispatch_tool` ahead of it.
+fn launch_token_text(
+    input: &serde_json::Value,
+    wallet: Option<&str>,
+    factory_address: &str,
+    busy: bool,
+    pending: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
+    last_card: &std::cell::RefCell<Option<Outcome>>,
+) -> String {
+    let Some(sender) = wallet else {
+        return "no wallet imported yet — the user needs to click \"Import wallet\" first".into();
+    };
+    if busy {
+        return "a swap or launch is already in progress in this app — wait for it to finish first"
+            .into();
+    }
+    let name = input["name"].as_str().unwrap_or_default().trim().to_string();
+    let symbol = input["symbol"].as_str().unwrap_or_default().trim().to_string();
+    let paired_stock = input["paired_stock"].as_str().unwrap_or_default().trim().to_string();
+    let threshold_human = input["graduation_threshold"].as_str().unwrap_or_default().trim();
+    if name.is_empty() || symbol.is_empty() || paired_stock.is_empty() || threshold_human.is_empty() {
+        return "error: name, symbol, paired_stock and graduation_threshold are all required".into();
+    }
+    let chain = match testnet_chain() {
+        Ok(c) => c,
+        Err(e) => return format!("error: {e}"),
+    };
+    let Some(stock) = chain.token(&paired_stock) else {
+        return format!(
+            "error: \"{paired_stock}\" isn't a known Robinhood Chain testnet stock token ({})",
+            chain.symbols().join(", ")
+        );
+    };
+    let threshold_raw = match tokens::parse_units(threshold_human, stock.decimals) {
+        Ok(0) => return "error: graduation_threshold is zero".into(),
+        Ok(v) => v,
+        Err(e) => return format!("error: {e}"),
+    };
+    let calldata = match bonding::encode_launch(&name, &symbol, stock.address, threshold_raw) {
+        Ok(c) => c,
+        Err(e) => return format!("error: {e}"),
+    };
+
+    // Simulate the exact same call first (`eth_call`, no state change) to
+    // read back `launch`'s own return value — the deployed curve's address
+    // — before spending real gas on it. Safe for a single-user testnet
+    // flow: the deployment address only depends on the factory's own
+    // nonce, which nothing else here advances between this read and the
+    // real send below.
+    let curve_address =
+        chain_rpc::eth_call(chain.id, factory_address, &calldata).map(|hex| bonding::decode_address(&hex));
+
+    match local_send_transaction(
+        chain.id,
+        sender,
+        factory_address,
+        &calldata,
+        0,
+        "Launch token",
+        format!("{symbol} paired with {paired_stock}"),
+        None,
+        &pending,
+    ) {
+        Ok(tx_hash) => {
+            let outcome = Outcome::TokenLaunch {
+                token_symbol: symbol,
+                token_name: name,
+                paired_symbol: stock.symbol.to_string(),
+                curve_address: curve_address.unwrap_or_default(),
+                tx_hash,
+            };
+            let text = tool_result_text(&outcome);
+            *last_card.borrow_mut() = Some(outcome);
+            text
+        }
+        Err(e) => format!("launch failed: {e}"),
+    }
+}
+
+/// The agent's door into buying on an already-launched curve
+/// (`buy_on_curve`) — same allowance-check-then-send shape as
+/// `run_local_swap_job`'s approve leg, just against the curve instead of
+/// Sushi's router, and against `bonding::encode_preview_buy`/`encode_buy`
+/// instead of the aggregator's own calldata.
+fn buy_on_curve_text(
+    input: &serde_json::Value,
+    wallet: Option<&str>,
+    busy: bool,
+    pending: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
+    last_card: &std::cell::RefCell<Option<Outcome>>,
+) -> String {
+    let Some(sender) = wallet else {
+        return "no wallet imported yet — the user needs to click \"Import wallet\" first".into();
+    };
+    if busy {
+        return "a swap or launch is already in progress in this app — wait for it to finish first"
+            .into();
+    }
+    let curve_address = input["curve_address"].as_str().unwrap_or_default().trim().to_string();
+    let paired_stock = input["paired_stock"].as_str().unwrap_or_default().trim().to_string();
+    let amount_human = input["stock_amount"].as_str().unwrap_or_default().trim().to_string();
+    if curve_address.is_empty() || paired_stock.is_empty() || amount_human.is_empty() {
+        return "error: curve_address, paired_stock and stock_amount are all required".into();
+    }
+    let chain = match testnet_chain() {
+        Ok(c) => c,
+        Err(e) => return format!("error: {e}"),
+    };
+    let Some(stock) = chain.token(&paired_stock) else {
+        return format!("error: \"{paired_stock}\" isn't a known Robinhood Chain testnet stock token");
+    };
+    let stock_in = match tokens::parse_units(&amount_human, stock.decimals) {
+        Ok(0) => return "error: stock_amount is zero".into(),
+        Ok(v) => v,
+        Err(e) => return format!("error: {e}"),
+    };
+
+    // Preview first — the curve's own `previewBuy` is the only place this
+    // price is computed; nothing here re-derives it from raw reserves.
+    let preview_call = bonding::encode_preview_buy(stock_in);
+    let expected_out = match chain_rpc::eth_call(chain.id, &curve_address, &preview_call) {
+        Ok(hex) => bonding::decode_uint256(&hex),
+        Err(e) => return format!("error: couldn't preview that buy — {e}"),
+    };
+    if expected_out == 0 {
+        return "error: previewed output is zero — check the curve address and amount".into();
+    }
+    let min_tokens_out = (expected_out as f64 * (1.0 - DEFAULT_SLIPPAGE)) as u128;
+
+    let allowance_call = match erc20::encode_allowance(sender, &curve_address) {
+        Ok(c) => c,
+        Err(e) => return format!("error: {e}"),
+    };
+    let current_allowance = match chain_rpc::eth_call(chain.id, stock.address, &allowance_call) {
+        Ok(hex) => erc20::decode_uint256(&hex),
+        Err(e) => return format!("error: {e}"),
+    };
+    if current_allowance < stock_in {
+        let approve_data = match erc20::encode_approve(&curve_address, MAX_APPROVAL) {
+            Ok(c) => c,
+            Err(e) => return format!("error: {e}"),
+        };
+        let approve_hash = match local_send_transaction(
+            chain.id,
+            sender,
+            stock.address,
+            &approve_data,
+            0,
+            "Approve token spending",
+            format!("infinite {} allowance", stock.symbol),
+            None,
+            &pending,
+        ) {
+            Ok(h) => h,
+            Err(e) => return format!("approval failed: {e}"),
+        };
+        if let Err(e) = chain_rpc::wait_for_receipt(chain.id, &approve_hash, APPROVAL_TIMEOUT) {
+            return format!("approval didn't confirm: {e}");
+        }
+    }
+
+    let buy_data = bonding::encode_buy(stock_in, min_tokens_out);
+    match local_send_transaction(
+        chain.id,
+        sender,
+        &curve_address,
+        &buy_data,
+        0,
+        "Buy on curve",
+        format!("{amount_human} {}", stock.symbol),
+        None,
+        &pending,
+    ) {
+        Ok(tx_hash) => {
+            let outcome = Outcome::CurveBuy {
+                curve_address,
+                paired_symbol: stock.symbol.to_string(),
+                stock_in: amount_human,
+                min_tokens_out: tokens::format_units(min_tokens_out, 18),
+                tx_hash,
+            };
+            let text = tool_result_text(&outcome);
+            *last_card.borrow_mut() = Some(outcome);
+            text
+        }
+        Err(e) => format!("buy failed: {e}"),
+    }
+}
+
+/// Read-only curve check (`curve_status`) — no signing, so unlike
+/// launch/buy it fits the generic `run()`-less match in `dispatch_tool`
+/// directly rather than needing its own special case.
+fn curve_status(input: &serde_json::Value) -> Result<Outcome, String> {
+    let curve_address = input["curve_address"].as_str().unwrap_or_default().trim().to_string();
+    let paired_stock = input["paired_stock"].as_str().unwrap_or_default().trim().to_string();
+    if curve_address.is_empty() || paired_stock.is_empty() {
+        return Err("curve_address and paired_stock are both required".to_string());
+    }
+    let chain = testnet_chain()?;
+    let Some(stock) = chain.token(&paired_stock) else {
+        return Err(format!("\"{paired_stock}\" isn't a known Robinhood Chain testnet stock token"));
+    };
+    let raised = chain_rpc::eth_call(chain.id, &curve_address, bonding::RAISED_CALL)
+        .map(|h| bonding::decode_uint256(&h))?;
+    let threshold = chain_rpc::eth_call(chain.id, &curve_address, bonding::GRADUATION_THRESHOLD_CALL)
+        .map(|h| bonding::decode_uint256(&h))?;
+    let graduated = chain_rpc::eth_call(chain.id, &curve_address, bonding::GRADUATED_CALL)
+        .map(|h| bonding::decode_bool(&h))?;
+    let (pool_address, price_per_token, progress_pct) = if graduated {
+        let pool = chain_rpc::eth_call(chain.id, &curve_address, bonding::POOL_CALL)
+            .map(|h| bonding::decode_address(&h))
+            .ok();
+        (pool, None, None)
+    } else {
+        // Spot price, read the same way any bonding-curve UI reads one: a
+        // tiny reference buy (0.001 of the paired stock — small enough next
+        // to the curve's virtual reserves that it barely moves the price,
+        // big enough that the output doesn't round down to zero) run
+        // through the curve's own `previewBuy`, never recomputed from raw
+        // reserves here.
+        const PRICE_SAMPLE_RAW: u128 = 1_000_000_000_000_000; // 0.001 token, 18 decimals
+        let price = chain_rpc::eth_call(chain.id, &curve_address, &bonding::encode_preview_buy(PRICE_SAMPLE_RAW))
+            .map(|h| bonding::decode_uint256(&h))
+            .ok()
+            .filter(|&tokens_out| tokens_out > 0)
+            .map(|tokens_out| PRICE_SAMPLE_RAW as f64 / tokens_out as f64);
+        let progress = (threshold > 0).then(|| raised as f64 / threshold as f64 * 100.0);
+        (None, price, progress)
+    };
+    Ok(Outcome::CurveStatus {
+        curve_address,
+        paired_symbol: stock.symbol.to_string(),
+        raised: tokens::format_units(raised, stock.decimals),
+        graduation_threshold: tokens::format_units(threshold, stock.decimals),
+        graduated,
+        pool_address,
+        price_per_token,
+        progress_pct,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_tool(
     name: &str,
@@ -1589,6 +2025,7 @@ fn dispatch_tool(
     swap_busy: bool,
     pending_confirm: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
     swap_step: std::sync::Arc<std::sync::Mutex<SwapStep>>,
+    bonding_cfg: &bonding::BondingConfig,
     last_card: &std::cell::RefCell<Option<Outcome>>,
 ) -> String {
     if name == "wallet_balance" {
@@ -1597,7 +2034,34 @@ fn dispatch_tool(
     if name == "execute_swap" {
         return execute_swap_text(input, wallet, api_key, ai_key, swap_busy, pending_confirm, swap_step);
     }
+    if name == "launch_token" {
+        if !bonding_cfg.use_testnet {
+            return "error: bonding-curve launches aren't enabled — the user needs to turn on \
+                \"Enable on Robinhood Chain testnet\" in the agent's settings first"
+                .to_string();
+        }
+        if bonding_cfg.factory_address.trim().is_empty() {
+            return "error: no bonding-curve factory address configured yet in settings".to_string();
+        }
+        return launch_token_text(
+            input,
+            wallet,
+            &bonding_cfg.factory_address,
+            swap_busy,
+            pending_confirm,
+            last_card,
+        );
+    }
+    if name == "buy_on_curve" {
+        if !bonding_cfg.use_testnet {
+            return "error: bonding-curve trading isn't enabled — the user needs to turn on \
+                \"Enable on Robinhood Chain testnet\" in the agent's settings first"
+                .to_string();
+        }
+        return buy_on_curve_text(input, wallet, swap_busy, pending_confirm, last_card);
+    }
     let result: Result<Outcome, String> = match name {
+        "curve_status" => curve_status(input),
         "market_overview" => {
             let sort = input["sort"].as_str().and_then(market::Sort::parse).unwrap_or(market::Sort::Volume);
             let limit = input["limit"].as_u64().unwrap_or(10).clamp(1, market::LIMIT_MAX as u64) as usize;
@@ -2155,6 +2619,7 @@ impl SushiTool {
         let swap_busy = self.swap_rx.is_some();
         let pending_confirm = self.pending_confirm.clone();
         let swap_step = self.swap_step.clone();
+        let bonding_cfg = self.bonding.clone();
         self.spawn(ctx, question.clone(), move || {
             let last_card = std::cell::RefCell::new(None);
             // Sonnet, not the default Haiku: this agent has to reliably call a
@@ -2162,10 +2627,10 @@ impl SushiTool {
             // was caught doing exactly that (a guessed ETH/USD conversion).
             let ai_key_for_tools = ai_key.clone();
             let anthropic = crate::llm::Anthropic::new(ai_key).with_model("claude-sonnet-5");
-            let tools = agent_tools();
+            let tools = agent_tools(bonding_cfg.use_testnet);
             let mut guard = messages.lock().unwrap();
             guard.push(serde_json::json!({ "role": "user", "content": question }));
-            let system = agent_system_prompt();
+            let system = agent_system_prompt(bonding_cfg.use_testnet);
             let reply = anthropic.converse(&system, &mut guard, &tools, |name, input| {
                 dispatch_tool(
                     name,
@@ -2177,6 +2642,7 @@ impl SushiTool {
                     swap_busy,
                     pending_confirm.clone(),
                     swap_step.clone(),
+                    &bonding_cfg,
                     &last_card,
                 )
             })?;
@@ -2220,6 +2686,19 @@ impl SushiTool {
                 (format!("found {} held token(s) currently trending", rows.len()), true)
             }
             Ok(Outcome::Dividend { ticker, .. }) => (format!("read {ticker}'s dividend info"), true),
+            Ok(Outcome::TokenLaunch { token_symbol, paired_symbol, .. }) => {
+                (format!("launched {token_symbol} paired with {paired_symbol} (testnet)"), true)
+            }
+            Ok(Outcome::CurveBuy { paired_symbol, stock_in, .. }) => {
+                (format!("bought on curve with {stock_in} {paired_symbol} (testnet)"), true)
+            }
+            Ok(Outcome::CurveStatus { curve_address, graduated, .. }) => (
+                format!(
+                    "checked curve {curve_address} status ({})",
+                    if *graduated { "graduated" } else { "still curving" }
+                ),
+                true,
+            ),
             Ok(Outcome::Chat { card, .. }) => (
                 match card.as_deref() {
                     Some(Outcome::Token { info, .. }) => format!("chatted, read {}", info.symbol),
@@ -2646,6 +3125,7 @@ impl Tool for SushiTool {
             self.ai_key = crate::secret::load_secret(&octx.config_dir.join("anthropic.key"));
             self.sushi_key = crate::secret::load_secret(&sushi_key_path(octx.config_dir));
             self.ondo_key = crate::secret::load_secret(&ondo_key_path(octx.config_dir));
+            self.bonding = bonding::load_config(octx.config_dir);
             // No "connect" handshake needed — if a key's already imported,
             // the wallet is simply already here.
             self.wallet = signer::address(octx.config_dir);
@@ -3016,6 +3496,33 @@ impl SushiTool {
                     "https://docs.ondo.finance/api-reference/quickstart",
                 );
             });
+        });
+
+        egui::CollapsingHeader::new(
+            RichText::new("Bonding-curve launches (testnet, experimental)").color(FAINT).small(),
+        )
+        .id_salt("bonding_section")
+        .show(ui, |ui| {
+            ui.checkbox(&mut self.bonding.use_testnet, "Enable on Robinhood Chain testnet");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.bonding.factory_address)
+                        .hint_text("0x… deployed BondingCurveFactory address")
+                        .desired_width(320.0),
+                );
+                if tool_button(ui, "Save", true) {
+                    bonding::save_config(octx.config_dir, &self.bonding);
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "Lets the agent launch a token whose bonding-curve liquidity is a Robinhood \
+                     Chain testnet stock token, and buy on it. Testnet only — no real funds, no \
+                     mainnet factory exists yet.",
+                )
+                .color(FAINT)
+                .small(),
+            );
         });
     }
 
@@ -4533,6 +5040,79 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                     .small(),
                 );
             }
+        }
+        Outcome::TokenLaunch { token_symbol, token_name, paired_symbol, curve_address, tx_hash } => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(token_symbol).color(FG).font(FontId::monospace(16.0)).strong());
+                ui.label(RichText::new("Launched · testnet").color(ORANGE).small());
+            });
+            ui.label(RichText::new(token_name).color(DIM).small());
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("paired with {paired_symbol}")).color(FAINT).small());
+            ui.label(
+                RichText::new(format!("curve: {curve_address}"))
+                    .color(ACCENT)
+                    .font(FontId::monospace(11.0)),
+            );
+            ui.label(RichText::new(format!("tx {tx_hash}")).color(FAINT).font(FontId::monospace(11.0)));
+        }
+        Outcome::CurveBuy { curve_address, paired_symbol, stock_in, min_tokens_out, tx_hash } => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Buy on curve").color(FG).strong());
+                ui.label(RichText::new("testnet").color(ORANGE).small());
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("spent {stock_in} {paired_symbol}, min {min_tokens_out} tokens out"))
+                    .color(DIM)
+                    .small(),
+            );
+            ui.label(RichText::new(format!("curve: {curve_address}")).color(FAINT).font(FontId::monospace(11.0)));
+            ui.label(RichText::new(format!("tx {tx_hash}")).color(FAINT).font(FontId::monospace(11.0)));
+        }
+        Outcome::CurveStatus {
+            curve_address,
+            paired_symbol,
+            raised,
+            graduation_threshold,
+            graduated,
+            pool_address,
+            price_per_token,
+            progress_pct,
+        } => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Curve status").color(FG).strong());
+                ui.label(
+                    RichText::new(if *graduated { "graduated" } else { "still curving" })
+                        .color(if *graduated { UP } else { ORANGE })
+                        .small(),
+                );
+            });
+            ui.add_space(4.0);
+            if let Some(price) = price_per_token {
+                ui.label(
+                    RichText::new(format!("{} {paired_symbol} per token", fmt_price(*price)))
+                        .color(ACCENT)
+                        .font(FontId::monospace(16.0)),
+                );
+            }
+            ui.label(
+                RichText::new(format!("{raised} of {graduation_threshold} {paired_symbol} raised"))
+                    .color(DIM)
+                    .small(),
+            );
+            if let Some(pct) = progress_pct {
+                let bar_color = if *pct >= 100.0 { UP } else { ORANGE };
+                ui.add(
+                    egui::ProgressBar::new((*pct / 100.0).clamp(0.0, 1.0) as f32)
+                        .text(format!("{pct:.1}%"))
+                        .fill(bar_color),
+                );
+            }
+            if let Some(pool) = pool_address {
+                ui.label(RichText::new(format!("pool: {pool}")).color(ACCENT).font(FontId::monospace(11.0)));
+            }
+            ui.label(RichText::new(format!("curve: {curve_address}")).color(FAINT).font(FontId::monospace(11.0)));
         }
     }
 }

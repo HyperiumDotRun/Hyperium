@@ -12,6 +12,10 @@ use serde_json::{Value, json};
 fn rpc_url(chain_id: u64) -> Result<&'static str, String> {
     match chain_id {
         4663 => Ok("https://rpc.mainnet.chain.robinhood.com"),
+        // Robinhood Chain testnet — used for the bonding-curve launch feature
+        // (`bonding.rs`) so it can be exercised end-to-end without real funds
+        // before any mainnet deploy is considered.
+        46630 => Ok("https://rpc.testnet.chain.robinhood.com"),
         other => Err(format!("no RPC endpoint configured for chain {other}")),
     }
 }
