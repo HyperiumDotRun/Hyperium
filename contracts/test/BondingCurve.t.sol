@@ -23,6 +23,7 @@ contract BondingCurveTest is Test {
     function setUp() public {
         factory = new BondingCurveFactory();
         stock = new MockERC20("Testnet TSLA", "TSLAon");
+        factory.addApprovedStockToken(address(stock));
 
         address curveAddr = factory.launch("Moon Token", "MOON", address(stock), THRESHOLD);
         curve = BondingCurve(curveAddr);
@@ -180,6 +181,7 @@ contract BondingCurveTest is Test {
 
     function test_Reentrancy_BuyBlocked() public {
         MaliciousReentrantToken evil = new MaliciousReentrantToken();
+        factory.addApprovedStockToken(address(evil));
         address curveAddr = factory.launch("Evil Token", "EVILT", address(evil), THRESHOLD);
         BondingCurve evilCurve = BondingCurve(curveAddr);
 
@@ -197,6 +199,7 @@ contract BondingCurveTest is Test {
 
     function test_Reentrancy_SellBlocked() public {
         MaliciousReentrantToken evil = new MaliciousReentrantToken();
+        factory.addApprovedStockToken(address(evil));
         address curveAddr = factory.launch("Evil Token", "EVILT", address(evil), THRESHOLD);
         BondingCurve evilCurve = BondingCurve(curveAddr);
         BondingCurveToken evilToken = evilCurve.token();

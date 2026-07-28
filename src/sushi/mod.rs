@@ -214,14 +214,19 @@ safe. Describe the route, not the decision.";
 fn agent_system_prompt(bonding_enabled: bool) -> String {
     let bonding_paragraph = if bonding_enabled {
         "\n\nA separate, experimental, TESTNET-ONLY feature is also on: launch_token, \
-         buy_on_curve and curve_status let someone launch a brand-new token whose bonding-curve \
-         liquidity is a Robinhood Chain TESTNET stock token instead of ETH/USDC (the longdotxyz \
-         idea), buy on it, and check how close it is to graduating into a pool. This is \
+         buy_on_curve, sell_on_curve, list_curves and curve_status let someone launch a \
+         brand-new token whose bonding-curve liquidity is a Robinhood Chain TESTNET stock token \
+         instead of ETH/USDC (the longdotxyz idea), buy or sell on it, browse every token \
+         launched so far, and check how close a given one is to graduating into a pool. This is \
          completely separate from execute_swap/lookup_token's real Robinhood Chain (mainnet) — \
          say plainly this is testnet, no real money, whenever it comes up. curve_address (from \
-         launch_token's result) is required for every later buy_on_curve/curve_status call on \
-         that token — never invent or guess one; if it isn't in this conversation already, say \
-         you don't have it rather than making one up."
+         launch_token's result, or looked up via list_curves) is required for every later \
+         buy_on_curve/sell_on_curve/curve_status call on that token — never invent or guess \
+         one; if it isn't in this conversation already and list_curves doesn't have it either, \
+         say you don't have it rather than making one up. Every launched curve also charges a \
+         small trading fee (basis points, forwarded to the platform) baked in at launch time — \
+         mention it if asked why a buy/sell's output is slightly less than the raw curve math \
+         would suggest, don't treat it as a bug."
     } else {
         ""
     };
@@ -462,6 +467,21 @@ enum Outcome {
         min_tokens_out: String,
         tx_hash: String,
     },
+    /// A sell against an already-launched curve. Unlike `CurveBuy`, this
+    /// never needs an approval leg first — `sell()` burns the caller's own
+    /// launched-token balance directly, no allowance involved.
+    CurveSell {
+        curve_address: String,
+        paired_symbol: String,
+        tokens_in: String,
+        min_stock_out: String,
+        tx_hash: String,
+    },
+    /// Every curve the configured factory has ever launched, newest last
+    /// (matches the factory's own `allCurves()` order) — the discovery tool,
+    /// so the model (and the user) can find a token without already knowing
+    /// its curve address.
+    CurveList { curves: Vec<CurveSummary> },
     /// A read-only check on a curve: how much of the paired stock token has
     /// been raised against its graduation threshold, and the pool address
     /// once it's graduated. `price_per_token`/`progress_pct` are `None` once
@@ -477,6 +497,20 @@ enum Outcome {
         price_per_token: Option<f64>,
         progress_pct: Option<f64>,
     },
+}
+
+/// One row of `Outcome::CurveList` — enough to identify a launched token and
+/// judge how close it is to graduating without a follow-up `curve_status`
+/// call for every entry.
+struct CurveSummary {
+    token_symbol: String,
+    token_name: String,
+    token_address: String,
+    curve_address: String,
+    paired_symbol: String,
+    raised: String,
+    graduation_threshold: String,
+    graduated: bool,
 }
 
 /// What a completed swap actually did, re-read from the chain side rather
@@ -674,11 +708,13 @@ fn chat_reply(outcome: &Outcome) -> String {
                 _ => format!("{ticker} doesn't have dividend data on file right now."),
             }
         }
-        // All three carry a full sentence already built by `tool_result_text`
-        // — nothing further to phrase on top of a launch/buy/status read.
-        Outcome::TokenLaunch { .. } | Outcome::CurveBuy { .. } | Outcome::CurveStatus { .. } => {
-            String::new()
-        }
+        // All five carry a full sentence already built by `tool_result_text`
+        // — nothing further to phrase on top of a launch/buy/sell/list/status read.
+        Outcome::TokenLaunch { .. }
+        | Outcome::CurveBuy { .. }
+        | Outcome::CurveSell { .. }
+        | Outcome::CurveList { .. }
+        | Outcome::CurveStatus { .. } => String::new(),
     }
 }
 
@@ -1352,6 +1388,35 @@ fn agent_tools(bonding_enabled: bool) -> Vec<crate::llm::ToolSpec> {
                 }),
             },
             crate::llm::ToolSpec {
+                name: "sell_on_curve",
+                description: "TESTNET ONLY: sell a bonding-curve token launched via \
+                    launch_token, back into the stock token it's paired with. curve_address \
+                    must be the exact address launch_token (or curve_status/list_curves) \
+                    returned for this token — never guess one. No approval needed first (unlike \
+                    buy_on_curve) — the curve burns the caller's own token balance directly. \
+                    Sends a real testnet transaction through the same confirmation panel as \
+                    execute_swap.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "curve_address": { "type": "string" },
+                        "paired_stock": { "type": "string", "description": "the stock token this curve is paired with, e.g. \"TSLA\"" },
+                        "token_amount": { "type": "string", "description": "plain decimal amount of the launched (bonding-curve) token to sell, e.g. \"1000\"" }
+                    },
+                    "required": ["curve_address", "paired_stock", "token_amount"]
+                }),
+            },
+            crate::llm::ToolSpec {
+                name: "list_curves",
+                description: "TESTNET ONLY, read-only: lists every token launched so far on the \
+                    configured factory — symbol, name, curve address, token address, how much \
+                    of its paired stock token has been raised against its graduation threshold, \
+                    and whether it's graduated. Use this to find a token's curve_address when \
+                    the user doesn't already have it, or to answer \"what's been launched\" / \
+                    \"what's close to graduating\". Takes no arguments.",
+                input_schema: json!({ "type": "object", "properties": {} }),
+            },
+            crate::llm::ToolSpec {
                 name: "curve_status",
                 description: "TESTNET ONLY, read-only: the curve's current live price (paired \
                     stock token per new token, read straight from the contract's own pricing \
@@ -1540,6 +1605,35 @@ fn tool_result_text(outcome: &Outcome) -> String {
                 "bought on curve {curve_address}: spent {stock_in} {paired_symbol}, minimum \
                  {min_tokens_out} tokens out after slippage (tx {tx_hash})"
             )
+        }
+        Outcome::CurveSell { curve_address, paired_symbol, tokens_in, min_stock_out, tx_hash } => {
+            format!(
+                "sold {tokens_in} tokens on curve {curve_address}: minimum {min_stock_out} \
+                 {paired_symbol} out after slippage (tx {tx_hash})"
+            )
+        }
+        Outcome::CurveList { curves } => {
+            if curves.is_empty() {
+                "no tokens have been launched on this factory yet".to_string()
+            } else {
+                let lines: Vec<String> = curves
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{} (\"{}\") — curve {}, token {} — {} of {} {} raised{}",
+                            c.token_symbol,
+                            c.token_name,
+                            c.curve_address,
+                            c.token_address,
+                            c.raised,
+                            c.graduation_threshold,
+                            c.paired_symbol,
+                            if c.graduated { " — graduated" } else { "" }
+                        )
+                    })
+                    .collect();
+                format!("{} token(s) launched so far:\n{}", curves.len(), lines.join("\n"))
+            }
         }
         Outcome::CurveStatus {
             curve_address,
@@ -1831,13 +1925,22 @@ fn launch_token_text(
         Ok(c) => c,
         Err(e) => return format!("error: {e}"),
     };
+    // The factory's anti-spam launch fee (native testnet ETH), read fresh
+    // every launch rather than assumed zero — `launch()` now requires the
+    // transaction's `value` to match this exactly.
+    let launch_fee = chain_rpc::eth_call(chain.id, factory_address, bonding::LAUNCH_FEE_CALL)
+        .map(|h| bonding::decode_uint256(&h))
+        .unwrap_or(0);
 
     // Simulate the exact same call first (`eth_call`, no state change) to
     // read back `launch`'s own return value — the deployed curve's address
     // — before spending real gas on it. Safe for a single-user testnet
     // flow: the deployment address only depends on the factory's own
     // nonce, which nothing else here advances between this read and the
-    // real send below.
+    // real send below. Note: `eth_call` here can't attach `value`, so this
+    // simulation only succeeds cleanly while `launch_fee` is zero — a
+    // nonzero launch fee just means `curve_address` falls back to empty
+    // below rather than failing the whole launch.
     let curve_address =
         chain_rpc::eth_call(chain.id, factory_address, &calldata).map(|hex| bonding::decode_address(&hex));
 
@@ -1846,7 +1949,7 @@ fn launch_token_text(
         sender,
         factory_address,
         &calldata,
-        0,
+        launch_fee,
         "Launch token",
         format!("{symbol} paired with {paired_stock}"),
         None,
@@ -1978,6 +2081,141 @@ fn buy_on_curve_text(
     }
 }
 
+/// The agent's door into selling back on an already-launched curve
+/// (`sell_on_curve`). Simpler than `buy_on_curve_text`: `sell()` burns the
+/// caller's own launched-token balance directly (see
+/// `BondingCurveToken.burn`'s `onlyCurve` modifier), so there's no allowance
+/// leg to check or approve first — one transaction, not up to two.
+fn sell_on_curve_text(
+    input: &serde_json::Value,
+    wallet: Option<&str>,
+    busy: bool,
+    pending: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
+    last_card: &std::cell::RefCell<Option<Outcome>>,
+) -> String {
+    let Some(sender) = wallet else {
+        return "no wallet imported yet — the user needs to click \"Import wallet\" first".into();
+    };
+    if busy {
+        return "a swap or launch is already in progress in this app — wait for it to finish first"
+            .into();
+    }
+    let curve_address = input["curve_address"].as_str().unwrap_or_default().trim().to_string();
+    let paired_stock = input["paired_stock"].as_str().unwrap_or_default().trim().to_string();
+    let amount_human = input["token_amount"].as_str().unwrap_or_default().trim().to_string();
+    if curve_address.is_empty() || paired_stock.is_empty() || amount_human.is_empty() {
+        return "error: curve_address, paired_stock and token_amount are all required".into();
+    }
+    let chain = match testnet_chain() {
+        Ok(c) => c,
+        Err(e) => return format!("error: {e}"),
+    };
+    let Some(stock) = chain.token(&paired_stock) else {
+        return format!("error: \"{paired_stock}\" isn't a known Robinhood Chain testnet stock token");
+    };
+    // The launched token is always 18 decimals (`BondingCurveToken.decimals()`
+    // is hardcoded, see the Solidity source) — not the paired stock token's.
+    let tokens_in = match tokens::parse_units(&amount_human, 18) {
+        Ok(0) => return "error: token_amount is zero".into(),
+        Ok(v) => v,
+        Err(e) => return format!("error: {e}"),
+    };
+
+    let preview_call = bonding::encode_preview_sell(tokens_in);
+    let expected_out = match chain_rpc::eth_call(chain.id, &curve_address, &preview_call) {
+        Ok(hex) => bonding::decode_uint256(&hex),
+        Err(e) => return format!("error: couldn't preview that sell — {e}"),
+    };
+    if expected_out == 0 {
+        return "error: previewed output is zero — check the curve address and amount".into();
+    }
+    let min_stock_out = (expected_out as f64 * (1.0 - DEFAULT_SLIPPAGE)) as u128;
+
+    let sell_data = bonding::encode_sell(tokens_in, min_stock_out);
+    match local_send_transaction(
+        chain.id,
+        sender,
+        &curve_address,
+        &sell_data,
+        0,
+        "Sell on curve",
+        format!("{amount_human} tokens"),
+        None,
+        &pending,
+    ) {
+        Ok(tx_hash) => {
+            let outcome = Outcome::CurveSell {
+                curve_address,
+                paired_symbol: stock.symbol.to_string(),
+                tokens_in: amount_human,
+                min_stock_out: tokens::format_units(min_stock_out, stock.decimals),
+                tx_hash,
+            };
+            let text = tool_result_text(&outcome);
+            *last_card.borrow_mut() = Some(outcome);
+            text
+        }
+        Err(e) => format!("sell failed: {e}"),
+    }
+}
+
+/// Read-only discovery (`list_curves`) — reads the factory's own
+/// `allCurves()`, then for each curve reads its token's `symbol()`/`name()`
+/// plus `raised`/`graduationThreshold`/`graduated`. No signing, fits the
+/// generic `run()`-less match in `dispatch_tool` directly.
+fn list_curves(bonding_cfg: &bonding::BondingConfig) -> Result<Outcome, String> {
+    if bonding_cfg.factory_address.trim().is_empty() {
+        return Err("no bonding-curve factory address configured yet in settings".to_string());
+    }
+    let chain = testnet_chain()?;
+    let factory = bonding_cfg.factory_address.trim();
+    let curve_addrs = chain_rpc::eth_call(chain.id, factory, bonding::ALL_CURVES_CALL)
+        .map(|h| bonding::decode_address_array(&h))?;
+
+    let mut curves = Vec::with_capacity(curve_addrs.len());
+    for curve_address in curve_addrs {
+        let token_address = match chain_rpc::eth_call(chain.id, &curve_address, bonding::TOKEN_CALL) {
+            Ok(h) => bonding::decode_address(&h),
+            Err(_) => continue, // a curve this factory didn't actually launch can't happen, but skip rather than fail the whole list
+        };
+        let token_symbol = chain_rpc::eth_call(chain.id, &token_address, bonding::SYMBOL_CALL)
+            .map(|h| bonding::decode_string(&h))
+            .unwrap_or_default();
+        let token_name = chain_rpc::eth_call(chain.id, &token_address, bonding::NAME_CALL)
+            .map(|h| bonding::decode_string(&h))
+            .unwrap_or_default();
+        let raised = chain_rpc::eth_call(chain.id, &curve_address, bonding::RAISED_CALL)
+            .map(|h| bonding::decode_uint256(&h))
+            .unwrap_or(0);
+        let threshold = chain_rpc::eth_call(chain.id, &curve_address, bonding::GRADUATION_THRESHOLD_CALL)
+            .map(|h| bonding::decode_uint256(&h))
+            .unwrap_or(0);
+        let graduated = chain_rpc::eth_call(chain.id, &curve_address, bonding::GRADUATED_CALL)
+            .map(|h| bonding::decode_bool(&h))
+            .unwrap_or(false);
+        let stock_token_address = chain_rpc::eth_call(chain.id, &curve_address, bonding::STOCK_TOKEN_CALL)
+            .map(|h| bonding::decode_address(&h))
+            .unwrap_or_default();
+        let paired_symbol = chain
+            .tokens
+            .iter()
+            .find(|t| t.address.eq_ignore_ascii_case(&stock_token_address))
+            .map(|t| t.symbol.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        curves.push(CurveSummary {
+            token_symbol,
+            token_name,
+            token_address,
+            curve_address,
+            paired_symbol,
+            raised: tokens::format_units(raised, 18),
+            graduation_threshold: tokens::format_units(threshold, 18),
+            graduated,
+        });
+    }
+    Ok(Outcome::CurveList { curves })
+}
+
 /// Read-only curve check (`curve_status`) — no signing, so unlike
 /// launch/buy it fits the generic `run()`-less match in `dispatch_tool`
 /// directly rather than needing its own special case.
@@ -2076,8 +2314,17 @@ fn dispatch_tool(
         }
         return buy_on_curve_text(input, wallet, swap_busy, pending_confirm, last_card);
     }
+    if name == "sell_on_curve" {
+        if !bonding_cfg.use_testnet {
+            return "error: bonding-curve trading isn't enabled — the user needs to turn on \
+                \"Enable on Robinhood Chain testnet\" in the agent's settings first"
+                .to_string();
+        }
+        return sell_on_curve_text(input, wallet, swap_busy, pending_confirm, last_card);
+    }
     let result: Result<Outcome, String> = match name {
         "curve_status" => curve_status(input),
+        "list_curves" => list_curves(bonding_cfg),
         "market_overview" => {
             let sort = input["sort"].as_str().and_then(market::Sort::parse).unwrap_or(market::Sort::Volume);
             let limit = input["limit"].as_u64().unwrap_or(10).clamp(1, market::LIMIT_MAX as u64) as usize;
@@ -2707,6 +2954,12 @@ impl SushiTool {
             }
             Ok(Outcome::CurveBuy { paired_symbol, stock_in, .. }) => {
                 (format!("bought on curve with {stock_in} {paired_symbol} (testnet)"), true)
+            }
+            Ok(Outcome::CurveSell { paired_symbol, tokens_in, .. }) => {
+                (format!("sold {tokens_in} tokens on curve for {paired_symbol} (testnet)"), true)
+            }
+            Ok(Outcome::CurveList { curves }) => {
+                (format!("listed {} launched token(s) (testnet)", curves.len()), true)
             }
             Ok(Outcome::CurveStatus { curve_address, graduated, .. }) => (
                 format!(
@@ -5117,6 +5370,68 @@ fn result_card_inner(ui: &mut egui::Ui, outcome: &Outcome) {
                 RichText::new(format!("tx {tx_hash} ↗")).color(FAINT).font(FontId::monospace(11.0)),
                 testnet_explorer_tx_url(tx_hash),
             );
+        }
+        Outcome::CurveSell { curve_address, paired_symbol, tokens_in, min_stock_out, tx_hash } => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Sell on curve").color(FG).strong());
+                ui.label(RichText::new("testnet").color(ORANGE).small());
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("sold {tokens_in} tokens, min {min_stock_out} {paired_symbol} out"))
+                    .color(DIM)
+                    .small(),
+            );
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("curve: {curve_address}")).color(FAINT).font(FontId::monospace(11.0)));
+                ui.hyperlink_to(
+                    RichText::new("view ↗").color(ACCENT).small(),
+                    testnet_explorer_address_url(curve_address),
+                );
+            });
+            ui.hyperlink_to(
+                RichText::new(format!("tx {tx_hash} ↗")).color(FAINT).font(FontId::monospace(11.0)),
+                testnet_explorer_tx_url(tx_hash),
+            );
+        }
+        Outcome::CurveList { curves } => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Launched tokens").color(FG).strong());
+                ui.label(RichText::new("testnet").color(ORANGE).small());
+            });
+            ui.add_space(4.0);
+            if curves.is_empty() {
+                ui.label(RichText::new("nothing launched on this factory yet").color(DIM).small());
+            }
+            for c in curves {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&c.token_symbol).color(FG).strong());
+                    ui.label(RichText::new(&c.token_name).color(DIM).small());
+                    if c.graduated {
+                        ui.label(RichText::new("graduated").color(UP).small());
+                    }
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "{} of {} {} raised",
+                        c.raised, c.graduation_threshold, c.paired_symbol
+                    ))
+                    .color(FAINT)
+                    .small(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("curve: {}", c.curve_address))
+                            .color(FAINT)
+                            .font(FontId::monospace(11.0)),
+                    );
+                    ui.hyperlink_to(
+                        RichText::new("view ↗").color(ACCENT).small(),
+                        testnet_explorer_address_url(&c.curve_address),
+                    );
+                });
+            }
         }
         Outcome::CurveStatus {
             curve_address,

@@ -22,6 +22,15 @@ contract BondingCurve is ReentrancyGuard {
     IERC20 public immutable stockToken;
     uint256 private immutable _graduationThreshold;
 
+    /// @notice Trading fee taken on every buy/sell, in basis points (1/100 of a
+    ///         percent), forwarded immediately to `feeRecipient`. Set once at launch
+    ///         time from the factory's current fee settings -- never changes for the
+    ///         lifetime of this curve, so a buyer's expected cost can't shift under
+    ///         them mid-trade.
+    uint256 public immutable feeBps;
+    address public immutable feeRecipient;
+    uint256 public constant MAX_FEE_BPS = 500; // 5% hard cap, mirrors the factory's own cap
+
     // ---- Virtual reserves (pump.fun-style constant product bonding curve) ----
     // Hardcoded rather than constructor params so every launch has an identical curve
     // shape (only the paired stock token and graduation threshold vary per launch).
@@ -48,16 +57,27 @@ contract BondingCurve is ReentrancyGuard {
 
     event Buy(address indexed buyer, uint256 stockIn, uint256 tokensOut);
     event Sell(address indexed seller, uint256 tokensIn, uint256 stockOut);
+    event Fee(address indexed payer, uint256 amount);
     event Graduated(address indexed pool, uint256 stockLiquidity, uint256 tokenLiquidity);
 
-    constructor(address token_, address stockToken_, uint256 graduationThreshold_) {
+    constructor(
+        address token_,
+        address stockToken_,
+        uint256 graduationThreshold_,
+        uint256 feeBps_,
+        address feeRecipient_
+    ) {
         require(token_ != address(0), "zero token");
         require(stockToken_ != address(0), "zero stock token");
         require(token_ != stockToken_, "identical tokens");
         require(graduationThreshold_ > 0, "zero threshold");
+        require(feeBps_ <= MAX_FEE_BPS, "fee too high");
+        require(feeBps_ == 0 || feeRecipient_ != address(0), "zero fee recipient");
         token = BondingCurveToken(token_);
         stockToken = IERC20(stockToken_);
         _graduationThreshold = graduationThreshold_;
+        feeBps = feeBps_;
+        feeRecipient = feeRecipient_;
     }
 
     function graduationThreshold() external view returns (uint256) {
@@ -67,8 +87,9 @@ contract BondingCurve is ReentrancyGuard {
     /// @notice Preview-only quote for buy(). Uses the exact same internal helper as
     ///         buy() itself, so an external caller can trust previewBuy() == what
     ///         buy() will actually execute (module any state changes in between).
+    ///         Quoted on the net-of-fee amount -- see buy()'s comment for why.
     function previewBuy(uint256 stockIn) external view returns (uint256) {
-        return _quoteBuy(stockIn);
+        return _quoteBuy(stockIn - (stockIn * feeBps) / 10_000);
     }
 
     /// @notice Preview-only quote for sell(). See previewBuy() notes.
@@ -80,11 +101,21 @@ contract BondingCurve is ReentrancyGuard {
         require(!graduated, "graduated: trade on the pool instead");
         require(stockIn > 0, "zero input");
 
-        uint256 tokensOut = _quoteBuy(stockIn);
+        // Priced on the net-of-fee amount -- that's what actually joins the curve's
+        // reserve, and pricing must match the reserve update exactly or a later
+        // sell() could demand more real stock token than the curve actually holds.
+        uint256 fee = (stockIn * feeBps) / 10_000;
+        uint256 netIn = stockIn - fee;
+        uint256 tokensOut = _quoteBuy(netIn);
         require(tokensOut >= minTokensOut, "slippage: insufficient output");
 
         stockToken.safeTransferFrom(msg.sender, address(this), stockIn);
-        raised += stockIn;
+
+        raised += netIn;
+        if (fee > 0) {
+            stockToken.safeTransfer(feeRecipient, fee);
+            emit Fee(msg.sender, fee);
+        }
         token.mint(msg.sender, tokensOut);
 
         emit Buy(msg.sender, stockIn, tokensOut);
@@ -103,13 +134,22 @@ contract BondingCurve is ReentrancyGuard {
         require(tokensIn > 0, "zero input");
 
         uint256 stockOut = _quoteSell(tokensIn);
-        require(stockOut >= minStockOut, "slippage: insufficient output");
         require(stockOut <= raised, "insufficient real stock liquidity");
         require(stockToken.balanceOf(address(this)) >= stockOut, "insufficient real stock liquidity");
 
+        uint256 fee = (stockOut * feeBps) / 10_000;
+        uint256 netOut = stockOut - fee;
+        // Slippage is checked against what the seller actually receives, not the
+        // pre-fee quote -- that's the number they can actually set an expectation on.
+        require(netOut >= minStockOut, "slippage: insufficient output");
+
         token.burn(msg.sender, tokensIn);
         raised -= stockOut;
-        stockToken.safeTransfer(msg.sender, stockOut);
+        if (fee > 0) {
+            stockToken.safeTransfer(feeRecipient, fee);
+            emit Fee(msg.sender, fee);
+        }
+        stockToken.safeTransfer(msg.sender, netOut);
 
         emit Sell(msg.sender, tokensIn, stockOut);
     }

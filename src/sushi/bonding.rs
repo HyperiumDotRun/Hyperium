@@ -129,6 +129,49 @@ pub fn encode_curve_of(token: &str) -> Result<String, String> {
     Ok(format!("0x05adc47e{}", pad_address(token)?))
 }
 
+/// Calldata for the curve's `token()` — no arguments, just the selector.
+pub const TOKEN_CALL: &str = "0xfc0c546a";
+/// Calldata for the curve's `stockToken()`.
+pub const STOCK_TOKEN_CALL: &str = "0xbaa8e786";
+/// Calldata for the factory's `allCurves()`.
+pub const ALL_CURVES_CALL: &str = "0xc69cfa15";
+/// Calldata for the factory's `launchFee()` — read before every `launch` so the
+/// transaction's native-currency `value` matches exactly what the contract requires.
+pub const LAUNCH_FEE_CALL: &str = "0xcf3cf573";
+/// Calldata for the ERC-20 standard `symbol()`.
+pub const SYMBOL_CALL: &str = "0x95d89b41";
+/// Calldata for the ERC-20 standard `name()`.
+pub const NAME_CALL: &str = "0x06fdde03";
+
+/// Decodes a dynamic `address[]` return value: a 32-byte offset (always `0x20`
+/// for a single top-level return value), a 32-byte length, then one
+/// right-aligned address word per entry.
+pub fn decode_address_array(hex: &str) -> Vec<String> {
+    let h = hex.trim().trim_start_matches("0x");
+    let words: Vec<&str> = h.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or("")).collect();
+    if words.len() < 2 {
+        return Vec::new();
+    }
+    let len = usize::from_str_radix(words[1], 16).unwrap_or(0);
+    words.iter().skip(2).take(len).map(|w| decode_address(&format!("0x{w}"))).collect()
+}
+
+/// Decodes a dynamic `string` return value: a 32-byte offset, a 32-byte byte
+/// length, then the UTF-8 bytes padded to a multiple of 32. Lossy on non-UTF-8
+/// bytes rather than erroring — a display-only token name/symbol is never
+/// worth failing an entire tool call over.
+pub fn decode_string(hex: &str) -> String {
+    let h = hex.trim().trim_start_matches("0x");
+    if h.len() < 128 {
+        return String::new();
+    }
+    let len_bytes = usize::from_str_radix(&h[64..128], 16).unwrap_or(0);
+    let data_hex_len = len_bytes * 2;
+    let data = h.get(128..128 + data_hex_len).unwrap_or("");
+    let bytes = hex::decode(data).unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Decodes a `uint256` return value. Delegates to `erc20::decode_uint256`
 /// rather than re-implementing it: same saturating-at-`u128::MAX` behavior,
 /// which is fine here since curve prices/amounts never approach that ceiling.
@@ -227,5 +270,38 @@ mod tests {
 
         let addr_word = format!("0x{:0>64}", &STOCK[2..]);
         assert_eq!(decode_address(&addr_word), STOCK);
+    }
+
+    #[test]
+    fn decodes_an_address_array() {
+        // offset (0x20) + length (2) + two right-aligned address words
+        let hex = format!("0x{:064x}{:064x}{:0>64}{:0>64}", 32, 2, "1", &STOCK[2..]);
+        let addrs = decode_address_array(&hex);
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[0], "0x0000000000000000000000000000000000000001");
+        assert_eq!(addrs[1], STOCK);
+    }
+
+    #[test]
+    fn decodes_an_empty_address_array() {
+        let hex = format!("0x{:064x}{:064x}", 32, 0);
+        assert!(decode_address_array(&hex).is_empty());
+    }
+
+    #[test]
+    fn decodes_a_string() {
+        // offset (0x20) + length (6) + "ROCKET" padded to 32 bytes
+        let mut data_hex = hex::encode(b"ROCKET");
+        while data_hex.len() < 64 {
+            data_hex.push('0');
+        }
+        let hex = format!("0x{:064x}{:064x}{data_hex}", 32, 6);
+        assert_eq!(decode_string(&hex), "ROCKET");
+    }
+
+    #[test]
+    fn decodes_an_empty_string() {
+        let hex = format!("0x{:064x}{:064x}", 32, 0);
+        assert_eq!(decode_string(&hex), "");
     }
 }

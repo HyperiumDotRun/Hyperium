@@ -19,6 +19,8 @@ contract BondingCurveFactoryTest is Test {
         factory = new BondingCurveFactory();
         stockA = new MockERC20("Testnet TSLA", "TSLAon");
         stockB = new MockERC20("Testnet AAPL", "AAPLon");
+        factory.addApprovedStockToken(address(stockA));
+        factory.addApprovedStockToken(address(stockB));
     }
 
     function test_Launch_ReturnsWorkingIndependentCurves_SameStockToken() public {
@@ -115,5 +117,42 @@ contract BondingCurveFactoryTest is Test {
             }
         }
         assertTrue(found, "Launched event must be emitted");
+    }
+
+    function test_Launch_RevertsIfStockTokenNotApproved() public {
+        MockERC20 unapproved = new MockERC20("Fake Stock", "FAKE");
+        vm.expectRevert("stock token not approved");
+        factory.launch("Scam Token", "SCAM", address(unapproved), 50e18);
+    }
+
+    function test_Owner_CanApproveAndRevokeStockToken() public {
+        MockERC20 fresh = new MockERC20("Testnet NVDA", "NVDAon");
+
+        vm.expectRevert("stock token not approved");
+        factory.launch("Chip Token", "CHIP", address(fresh), 50e18);
+
+        factory.addApprovedStockToken(address(fresh));
+        assertTrue(factory.isApprovedStockToken(address(fresh)));
+        address curveAddr = factory.launch("Chip Token", "CHIP", address(fresh), 50e18);
+        assertTrue(curveAddr != address(0));
+
+        factory.removeApprovedStockToken(address(fresh));
+        assertFalse(factory.isApprovedStockToken(address(fresh)));
+        vm.expectRevert("stock token not approved");
+        factory.launch("Chip Token 2", "CHIP2", address(fresh), 50e18);
+    }
+
+    function test_NonOwner_CannotApproveOrRevokeStockToken() public {
+        vm.startPrank(alice);
+        vm.expectRevert("not owner");
+        factory.addApprovedStockToken(address(0xbeef));
+        vm.expectRevert("not owner");
+        factory.removeApprovedStockToken(address(stockA));
+        vm.stopPrank();
+    }
+
+    function test_AddApprovedStockToken_RejectsZeroAddress() public {
+        vm.expectRevert("zero stock token");
+        factory.addApprovedStockToken(address(0));
     }
 }
