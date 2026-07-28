@@ -501,7 +501,10 @@ enum Outcome {
 
 /// One row of `Outcome::CurveList` — enough to identify a launched token and
 /// judge how close it is to graduating without a follow-up `curve_status`
-/// call for every entry.
+/// call for every entry. `Clone` so the Launcher tab can snapshot the list
+/// out of `self` before iterating it (egui rows need `&mut self` for their
+/// own widgets at the same time).
+#[derive(Clone)]
 struct CurveSummary {
     token_symbol: String,
     token_name: String,
@@ -746,6 +749,11 @@ enum Tab {
     Chat,
     Robinhood,
     Ondo,
+    /// Non-agentic, dex-like door onto the bonding-curve launch feature —
+    /// browse/launch/buy/sell with forms and buttons, no chat required. Only
+    /// meaningfully usable once the testnet toggle is on (see `bonding.rs`);
+    /// shown regardless so the feature is discoverable, gated inside.
+    Launcher,
 }
 
 pub struct SushiTool {
@@ -882,6 +890,34 @@ pub struct SushiTool {
     /// `bonding::load_config`/`save_config`'s plain flat files, since neither
     /// value is a secret.
     bonding: bonding::BondingConfig,
+
+    /// Non-agentic "Launcher" tab — a dex-like browse/launch/buy/sell door
+    /// onto the same bonding-curve feature the chat tools already expose,
+    /// built on the same `launch_token_job`/`buy_on_curve_job`/
+    /// `sell_on_curve_job` cores so there's exactly one implementation of
+    /// each action, just two ways to trigger it.
+    launcher_curves: Vec<CurveSummary>,
+    launcher_curves_rx: Option<Receiver<Result<Outcome, String>>>,
+    launcher_curves_err: Option<String>,
+    launcher_curves_at: Option<Instant>,
+    /// Which curve (by address) is expanded for buy/sell in the list below —
+    /// `None` collapses every row back to just its summary line.
+    launcher_selected: Option<String>,
+    launcher_buy_amount: String,
+    launcher_sell_amount: String,
+    launcher_launch_name: String,
+    launcher_launch_symbol: String,
+    /// Index into the testnet chain's token list — a picker, not free text,
+    /// same reasoning as everywhere else in this module: the model/user
+    /// only ever chooses among known-good addresses, never types one in.
+    launcher_launch_paired_idx: usize,
+    launcher_launch_threshold: String,
+    /// A launch/buy/sell in flight from this tab — kept apart from the
+    /// chat's own `rx`/`busy_since` so using this tab never looks like (or
+    /// collides with) an in-flight chat turn.
+    launcher_action_rx: Option<Receiver<Result<Outcome, String>>>,
+    launcher_action_busy_since: Option<Instant>,
+    launcher_last_result: Option<Result<Outcome, String>>,
 }
 
 impl Default for SushiTool {
@@ -946,6 +982,21 @@ impl Default for SushiTool {
             source_symbol: "WETH".to_string(),
 
             bonding: bonding::BondingConfig::default(),
+
+            launcher_curves: Vec::new(),
+            launcher_curves_rx: None,
+            launcher_curves_err: None,
+            launcher_curves_at: None,
+            launcher_selected: None,
+            launcher_buy_amount: "1".into(),
+            launcher_sell_amount: "1".into(),
+            launcher_launch_name: String::new(),
+            launcher_launch_symbol: String::new(),
+            launcher_launch_paired_idx: 0,
+            launcher_launch_threshold: "100".into(),
+            launcher_action_rx: None,
+            launcher_action_busy_since: None,
+            launcher_last_result: None,
         }
     }
 }
@@ -1880,6 +1931,73 @@ fn testnet_chain() -> Result<&'static tokens::Chain, String> {
         .ok_or_else(|| "Robinhood Chain testnet isn't configured".to_string())
 }
 
+/// The actual launch logic, no JSON involved — shared by `launch_token_text`
+/// (the agent tool) and `SushiTool::submit_launch` (the non-agentic Launcher
+/// tab), same split as `execute_swap_text`/`run_local_swap_job`.
+fn launch_token_job(
+    name: String,
+    symbol: String,
+    paired_stock: &str,
+    threshold_human: &str,
+    sender: &str,
+    factory_address: &str,
+    pending: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
+) -> Result<Outcome, String> {
+    if name.is_empty() || symbol.is_empty() || paired_stock.is_empty() || threshold_human.is_empty() {
+        return Err("name, symbol, paired_stock and graduation_threshold are all required".into());
+    }
+    let chain = testnet_chain()?;
+    let Some(stock) = chain.token(paired_stock) else {
+        return Err(format!(
+            "\"{paired_stock}\" isn't a known Robinhood Chain testnet stock token ({})",
+            chain.symbols().join(", ")
+        ));
+    };
+    let threshold_raw = match tokens::parse_units(threshold_human, stock.decimals) {
+        Ok(0) => return Err("graduation_threshold is zero".into()),
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
+    let calldata = bonding::encode_launch(&name, &symbol, stock.address, threshold_raw)?;
+    // The factory's anti-spam launch fee (native testnet ETH), read fresh
+    // every launch rather than assumed zero — `launch()` now requires the
+    // transaction's `value` to match this exactly.
+    let launch_fee = chain_rpc::eth_call(chain.id, factory_address, bonding::LAUNCH_FEE_CALL)
+        .map(|h| bonding::decode_uint256(&h))
+        .unwrap_or(0);
+
+    // Simulate the exact same call first (`eth_call`, no state change) to
+    // read back `launch`'s own return value — the deployed curve's address
+    // — before spending real gas on it. Safe for a single-user testnet
+    // flow: the deployment address only depends on the factory's own
+    // nonce, which nothing else here advances between this read and the
+    // real send below. Note: `eth_call` here can't attach `value`, so this
+    // simulation only succeeds cleanly while `launch_fee` is zero — a
+    // nonzero launch fee just means `curve_address` falls back to empty
+    // below rather than failing the whole launch.
+    let curve_address =
+        chain_rpc::eth_call(chain.id, factory_address, &calldata).map(|hex| bonding::decode_address(&hex));
+
+    let tx_hash = local_send_transaction(
+        chain.id,
+        sender,
+        factory_address,
+        &calldata,
+        launch_fee,
+        "Launch token",
+        format!("{symbol} paired with {paired_stock}"),
+        None,
+        &pending,
+    )?;
+    Ok(Outcome::TokenLaunch {
+        token_symbol: symbol,
+        token_name: name,
+        paired_symbol: stock.symbol.to_string(),
+        curve_address: curve_address.unwrap_or_default(),
+        tx_hash,
+    })
+}
+
 /// The agent's door into launching a bonding-curve token (`launch_token`) —
 /// a state-changing call, so like `execute_swap_text` it goes through
 /// `PendingConfirm`/`local_send_transaction` rather than the generic `run()`
@@ -1902,80 +2020,98 @@ fn launch_token_text(
     let name = input["name"].as_str().unwrap_or_default().trim().to_string();
     let symbol = input["symbol"].as_str().unwrap_or_default().trim().to_string();
     let paired_stock = input["paired_stock"].as_str().unwrap_or_default().trim().to_string();
-    let threshold_human = input["graduation_threshold"].as_str().unwrap_or_default().trim();
-    if name.is_empty() || symbol.is_empty() || paired_stock.is_empty() || threshold_human.is_empty() {
-        return "error: name, symbol, paired_stock and graduation_threshold are all required".into();
-    }
-    let chain = match testnet_chain() {
-        Ok(c) => c,
-        Err(e) => return format!("error: {e}"),
-    };
-    let Some(stock) = chain.token(&paired_stock) else {
-        return format!(
-            "error: \"{paired_stock}\" isn't a known Robinhood Chain testnet stock token ({})",
-            chain.symbols().join(", ")
-        );
-    };
-    let threshold_raw = match tokens::parse_units(threshold_human, stock.decimals) {
-        Ok(0) => return "error: graduation_threshold is zero".into(),
-        Ok(v) => v,
-        Err(e) => return format!("error: {e}"),
-    };
-    let calldata = match bonding::encode_launch(&name, &symbol, stock.address, threshold_raw) {
-        Ok(c) => c,
-        Err(e) => return format!("error: {e}"),
-    };
-    // The factory's anti-spam launch fee (native testnet ETH), read fresh
-    // every launch rather than assumed zero — `launch()` now requires the
-    // transaction's `value` to match this exactly.
-    let launch_fee = chain_rpc::eth_call(chain.id, factory_address, bonding::LAUNCH_FEE_CALL)
-        .map(|h| bonding::decode_uint256(&h))
-        .unwrap_or(0);
-
-    // Simulate the exact same call first (`eth_call`, no state change) to
-    // read back `launch`'s own return value — the deployed curve's address
-    // — before spending real gas on it. Safe for a single-user testnet
-    // flow: the deployment address only depends on the factory's own
-    // nonce, which nothing else here advances between this read and the
-    // real send below. Note: `eth_call` here can't attach `value`, so this
-    // simulation only succeeds cleanly while `launch_fee` is zero — a
-    // nonzero launch fee just means `curve_address` falls back to empty
-    // below rather than failing the whole launch.
-    let curve_address =
-        chain_rpc::eth_call(chain.id, factory_address, &calldata).map(|hex| bonding::decode_address(&hex));
-
-    match local_send_transaction(
-        chain.id,
-        sender,
-        factory_address,
-        &calldata,
-        launch_fee,
-        "Launch token",
-        format!("{symbol} paired with {paired_stock}"),
-        None,
-        &pending,
-    ) {
-        Ok(tx_hash) => {
-            let outcome = Outcome::TokenLaunch {
-                token_symbol: symbol,
-                token_name: name,
-                paired_symbol: stock.symbol.to_string(),
-                curve_address: curve_address.unwrap_or_default(),
-                tx_hash,
-            };
+    let threshold_human = input["graduation_threshold"].as_str().unwrap_or_default().trim().to_string();
+    match launch_token_job(name, symbol, &paired_stock, &threshold_human, sender, factory_address, pending) {
+        Ok(outcome) => {
             let text = tool_result_text(&outcome);
             *last_card.borrow_mut() = Some(outcome);
             text
         }
-        Err(e) => format!("launch failed: {e}"),
+        Err(e) => format!("error: {e}"),
     }
 }
 
-/// The agent's door into buying on an already-launched curve
-/// (`buy_on_curve`) — same allowance-check-then-send shape as
+/// The actual buy logic, no JSON involved — shared by `buy_on_curve_text`
+/// and `SushiTool::submit_buy`. Same allowance-check-then-send shape as
 /// `run_local_swap_job`'s approve leg, just against the curve instead of
 /// Sushi's router, and against `bonding::encode_preview_buy`/`encode_buy`
 /// instead of the aggregator's own calldata.
+fn buy_on_curve_job(
+    curve_address: String,
+    paired_stock: &str,
+    amount_human: String,
+    sender: &str,
+    pending: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
+) -> Result<Outcome, String> {
+    if curve_address.is_empty() || paired_stock.is_empty() || amount_human.is_empty() {
+        return Err("curve_address, paired_stock and stock_amount are all required".into());
+    }
+    let chain = testnet_chain()?;
+    let Some(stock) = chain.token(paired_stock) else {
+        return Err(format!("\"{paired_stock}\" isn't a known Robinhood Chain testnet stock token"));
+    };
+    let stock_in = match tokens::parse_units(&amount_human, stock.decimals) {
+        Ok(0) => return Err("stock_amount is zero".into()),
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
+
+    // Preview first — the curve's own `previewBuy` is the only place this
+    // price is computed; nothing here re-derives it from raw reserves.
+    let preview_call = bonding::encode_preview_buy(stock_in);
+    let expected_out = chain_rpc::eth_call(chain.id, &curve_address, &preview_call)
+        .map(|hex| bonding::decode_uint256(&hex))
+        .map_err(|e| format!("couldn't preview that buy — {e}"))?;
+    if expected_out == 0 {
+        return Err("previewed output is zero — check the curve address and amount".into());
+    }
+    let min_tokens_out = (expected_out as f64 * (1.0 - DEFAULT_SLIPPAGE)) as u128;
+
+    let allowance_call = erc20::encode_allowance(sender, &curve_address)?;
+    let current_allowance = chain_rpc::eth_call(chain.id, stock.address, &allowance_call)
+        .map(|hex| erc20::decode_uint256(&hex))?;
+    if current_allowance < stock_in {
+        let approve_data = erc20::encode_approve(&curve_address, MAX_APPROVAL)?;
+        let approve_hash = local_send_transaction(
+            chain.id,
+            sender,
+            stock.address,
+            &approve_data,
+            0,
+            "Approve token spending",
+            format!("infinite {} allowance", stock.symbol),
+            None,
+            &pending,
+        )
+        .map_err(|e| format!("approval failed: {e}"))?;
+        chain_rpc::wait_for_receipt(chain.id, &approve_hash, APPROVAL_TIMEOUT)
+            .map_err(|e| format!("approval didn't confirm: {e}"))?;
+    }
+
+    let buy_data = bonding::encode_buy(stock_in, min_tokens_out);
+    let tx_hash = local_send_transaction(
+        chain.id,
+        sender,
+        &curve_address,
+        &buy_data,
+        0,
+        "Buy on curve",
+        format!("{amount_human} {}", stock.symbol),
+        None,
+        &pending,
+    )
+    .map_err(|e| format!("buy failed: {e}"))?;
+    Ok(Outcome::CurveBuy {
+        curve_address,
+        paired_symbol: stock.symbol.to_string(),
+        stock_in: amount_human,
+        min_tokens_out: tokens::format_units(min_tokens_out, 18),
+        tx_hash,
+    })
+}
+
+/// The agent's door into buying on an already-launched curve
+/// (`buy_on_curve`).
 fn buy_on_curve_text(
     input: &serde_json::Value,
     wallet: Option<&str>,
@@ -1993,99 +2129,76 @@ fn buy_on_curve_text(
     let curve_address = input["curve_address"].as_str().unwrap_or_default().trim().to_string();
     let paired_stock = input["paired_stock"].as_str().unwrap_or_default().trim().to_string();
     let amount_human = input["stock_amount"].as_str().unwrap_or_default().trim().to_string();
-    if curve_address.is_empty() || paired_stock.is_empty() || amount_human.is_empty() {
-        return "error: curve_address, paired_stock and stock_amount are all required".into();
-    }
-    let chain = match testnet_chain() {
-        Ok(c) => c,
-        Err(e) => return format!("error: {e}"),
-    };
-    let Some(stock) = chain.token(&paired_stock) else {
-        return format!("error: \"{paired_stock}\" isn't a known Robinhood Chain testnet stock token");
-    };
-    let stock_in = match tokens::parse_units(&amount_human, stock.decimals) {
-        Ok(0) => return "error: stock_amount is zero".into(),
-        Ok(v) => v,
-        Err(e) => return format!("error: {e}"),
-    };
-
-    // Preview first — the curve's own `previewBuy` is the only place this
-    // price is computed; nothing here re-derives it from raw reserves.
-    let preview_call = bonding::encode_preview_buy(stock_in);
-    let expected_out = match chain_rpc::eth_call(chain.id, &curve_address, &preview_call) {
-        Ok(hex) => bonding::decode_uint256(&hex),
-        Err(e) => return format!("error: couldn't preview that buy — {e}"),
-    };
-    if expected_out == 0 {
-        return "error: previewed output is zero — check the curve address and amount".into();
-    }
-    let min_tokens_out = (expected_out as f64 * (1.0 - DEFAULT_SLIPPAGE)) as u128;
-
-    let allowance_call = match erc20::encode_allowance(sender, &curve_address) {
-        Ok(c) => c,
-        Err(e) => return format!("error: {e}"),
-    };
-    let current_allowance = match chain_rpc::eth_call(chain.id, stock.address, &allowance_call) {
-        Ok(hex) => erc20::decode_uint256(&hex),
-        Err(e) => return format!("error: {e}"),
-    };
-    if current_allowance < stock_in {
-        let approve_data = match erc20::encode_approve(&curve_address, MAX_APPROVAL) {
-            Ok(c) => c,
-            Err(e) => return format!("error: {e}"),
-        };
-        let approve_hash = match local_send_transaction(
-            chain.id,
-            sender,
-            stock.address,
-            &approve_data,
-            0,
-            "Approve token spending",
-            format!("infinite {} allowance", stock.symbol),
-            None,
-            &pending,
-        ) {
-            Ok(h) => h,
-            Err(e) => return format!("approval failed: {e}"),
-        };
-        if let Err(e) = chain_rpc::wait_for_receipt(chain.id, &approve_hash, APPROVAL_TIMEOUT) {
-            return format!("approval didn't confirm: {e}");
-        }
-    }
-
-    let buy_data = bonding::encode_buy(stock_in, min_tokens_out);
-    match local_send_transaction(
-        chain.id,
-        sender,
-        &curve_address,
-        &buy_data,
-        0,
-        "Buy on curve",
-        format!("{amount_human} {}", stock.symbol),
-        None,
-        &pending,
-    ) {
-        Ok(tx_hash) => {
-            let outcome = Outcome::CurveBuy {
-                curve_address,
-                paired_symbol: stock.symbol.to_string(),
-                stock_in: amount_human,
-                min_tokens_out: tokens::format_units(min_tokens_out, 18),
-                tx_hash,
-            };
+    match buy_on_curve_job(curve_address, &paired_stock, amount_human, sender, pending) {
+        Ok(outcome) => {
             let text = tool_result_text(&outcome);
             *last_card.borrow_mut() = Some(outcome);
             text
         }
-        Err(e) => format!("buy failed: {e}"),
+        Err(e) => format!("error: {e}"),
     }
 }
 
-/// The agent's door into selling back on an already-launched curve
-/// (`sell_on_curve`). Simpler than `buy_on_curve_text`: `sell()` burns the
-/// caller's own launched-token balance directly (see
+/// The actual sell logic, no JSON involved — shared by `sell_on_curve_text`
+/// and `SushiTool::submit_sell`. Simpler than `buy_on_curve_job`: `sell()`
+/// burns the caller's own launched-token balance directly (see
 /// `BondingCurveToken.burn`'s `onlyCurve` modifier), so there's no allowance
 /// leg to check or approve first — one transaction, not up to two.
+fn sell_on_curve_job(
+    curve_address: String,
+    paired_stock: &str,
+    amount_human: String,
+    sender: &str,
+    pending: std::sync::Arc<std::sync::Mutex<Option<PendingConfirm>>>,
+) -> Result<Outcome, String> {
+    if curve_address.is_empty() || paired_stock.is_empty() || amount_human.is_empty() {
+        return Err("curve_address, paired_stock and token_amount are all required".into());
+    }
+    let chain = testnet_chain()?;
+    let Some(stock) = chain.token(paired_stock) else {
+        return Err(format!("\"{paired_stock}\" isn't a known Robinhood Chain testnet stock token"));
+    };
+    // The launched token is always 18 decimals (`BondingCurveToken.decimals()`
+    // is hardcoded, see the Solidity source) — not the paired stock token's.
+    let tokens_in = match tokens::parse_units(&amount_human, 18) {
+        Ok(0) => return Err("token_amount is zero".into()),
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
+
+    let preview_call = bonding::encode_preview_sell(tokens_in);
+    let expected_out = chain_rpc::eth_call(chain.id, &curve_address, &preview_call)
+        .map(|hex| bonding::decode_uint256(&hex))
+        .map_err(|e| format!("couldn't preview that sell — {e}"))?;
+    if expected_out == 0 {
+        return Err("previewed output is zero — check the curve address and amount".into());
+    }
+    let min_stock_out = (expected_out as f64 * (1.0 - DEFAULT_SLIPPAGE)) as u128;
+
+    let sell_data = bonding::encode_sell(tokens_in, min_stock_out);
+    let tx_hash = local_send_transaction(
+        chain.id,
+        sender,
+        &curve_address,
+        &sell_data,
+        0,
+        "Sell on curve",
+        format!("{amount_human} tokens"),
+        None,
+        &pending,
+    )
+    .map_err(|e| format!("sell failed: {e}"))?;
+    Ok(Outcome::CurveSell {
+        curve_address,
+        paired_symbol: stock.symbol.to_string(),
+        tokens_in: amount_human,
+        min_stock_out: tokens::format_units(min_stock_out, stock.decimals),
+        tx_hash,
+    })
+}
+
+/// The agent's door into selling back on an already-launched curve
+/// (`sell_on_curve`).
 fn sell_on_curve_text(
     input: &serde_json::Value,
     wallet: Option<&str>,
@@ -2103,59 +2216,13 @@ fn sell_on_curve_text(
     let curve_address = input["curve_address"].as_str().unwrap_or_default().trim().to_string();
     let paired_stock = input["paired_stock"].as_str().unwrap_or_default().trim().to_string();
     let amount_human = input["token_amount"].as_str().unwrap_or_default().trim().to_string();
-    if curve_address.is_empty() || paired_stock.is_empty() || amount_human.is_empty() {
-        return "error: curve_address, paired_stock and token_amount are all required".into();
-    }
-    let chain = match testnet_chain() {
-        Ok(c) => c,
-        Err(e) => return format!("error: {e}"),
-    };
-    let Some(stock) = chain.token(&paired_stock) else {
-        return format!("error: \"{paired_stock}\" isn't a known Robinhood Chain testnet stock token");
-    };
-    // The launched token is always 18 decimals (`BondingCurveToken.decimals()`
-    // is hardcoded, see the Solidity source) — not the paired stock token's.
-    let tokens_in = match tokens::parse_units(&amount_human, 18) {
-        Ok(0) => return "error: token_amount is zero".into(),
-        Ok(v) => v,
-        Err(e) => return format!("error: {e}"),
-    };
-
-    let preview_call = bonding::encode_preview_sell(tokens_in);
-    let expected_out = match chain_rpc::eth_call(chain.id, &curve_address, &preview_call) {
-        Ok(hex) => bonding::decode_uint256(&hex),
-        Err(e) => return format!("error: couldn't preview that sell — {e}"),
-    };
-    if expected_out == 0 {
-        return "error: previewed output is zero — check the curve address and amount".into();
-    }
-    let min_stock_out = (expected_out as f64 * (1.0 - DEFAULT_SLIPPAGE)) as u128;
-
-    let sell_data = bonding::encode_sell(tokens_in, min_stock_out);
-    match local_send_transaction(
-        chain.id,
-        sender,
-        &curve_address,
-        &sell_data,
-        0,
-        "Sell on curve",
-        format!("{amount_human} tokens"),
-        None,
-        &pending,
-    ) {
-        Ok(tx_hash) => {
-            let outcome = Outcome::CurveSell {
-                curve_address,
-                paired_symbol: stock.symbol.to_string(),
-                tokens_in: amount_human,
-                min_stock_out: tokens::format_units(min_stock_out, stock.decimals),
-                tx_hash,
-            };
+    match sell_on_curve_job(curve_address, &paired_stock, amount_human, sender, pending) {
+        Ok(outcome) => {
             let text = tool_result_text(&outcome);
             *last_card.borrow_mut() = Some(outcome);
             text
         }
-        Err(e) => format!("sell failed: {e}"),
+        Err(e) => format!("error: {e}"),
     }
 }
 
@@ -2614,6 +2681,81 @@ impl SushiTool {
         });
         self.ondo_rx = Some(rx);
         ctx.request_repaint();
+    }
+
+    /// Refreshes the Launcher tab's browse list — reads the configured
+    /// factory's `allCurves()` plus each curve's own state. Called on tab
+    /// open and after any action from this tab succeeds; the user can also
+    /// re-trigger it manually since nothing here auto-polls (unlike
+    /// market/trending, a curve's state only changes when someone trades on
+    /// it, not continuously).
+    fn refresh_launcher_curves(&mut self, ctx: &egui::Context) {
+        if self.launcher_curves_rx.is_some() {
+            return;
+        }
+        let cfg = self.bonding.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(list_curves(&cfg));
+        });
+        self.launcher_curves_rx = Some(rx);
+        ctx.request_repaint();
+    }
+
+    /// Fires a launch/buy/sell from the Launcher tab's forms — same
+    /// `pending_confirm` the chat path uses, so the exact same confirmation
+    /// modal blocks the action either way. `busy` mirrors `run_swap`'s own
+    /// guard: only one of these at a time, independent of whether a chat
+    /// turn is also in flight (those use a separate channel).
+    fn run_launcher_action(
+        &mut self,
+        ctx: &egui::Context,
+        job: impl FnOnce() -> Result<Outcome, String> + Send + 'static,
+    ) {
+        if self.launcher_action_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+        self.launcher_action_rx = Some(rx);
+        self.launcher_action_busy_since = Some(Instant::now());
+        self.launcher_last_result = None;
+        ctx.request_repaint();
+    }
+
+    fn submit_launch(&mut self, ctx: &egui::Context) {
+        let Some(sender) = self.wallet.clone() else { return };
+        let Ok(chain) = testnet_chain() else { return };
+        let Some(stock) = chain.tokens.get(self.launcher_launch_paired_idx) else { return };
+        let name = self.launcher_launch_name.trim().to_string();
+        let symbol = self.launcher_launch_symbol.trim().to_string();
+        let paired = stock.symbol.to_string();
+        let threshold = self.launcher_launch_threshold.trim().to_string();
+        let factory_address = self.bonding.factory_address.trim().to_string();
+        let pending = self.pending_confirm.clone();
+        self.run_launcher_action(ctx, move || {
+            launch_token_job(name, symbol, &paired, &threshold, &sender, &factory_address, pending)
+        });
+    }
+
+    fn submit_buy(&mut self, ctx: &egui::Context, curve_address: String, paired_symbol: String) {
+        let Some(sender) = self.wallet.clone() else { return };
+        let amount = self.launcher_buy_amount.trim().to_string();
+        let pending = self.pending_confirm.clone();
+        self.run_launcher_action(ctx, move || {
+            buy_on_curve_job(curve_address, &paired_symbol, amount, &sender, pending)
+        });
+    }
+
+    fn submit_sell(&mut self, ctx: &egui::Context, curve_address: String, paired_symbol: String) {
+        let Some(sender) = self.wallet.clone() else { return };
+        let amount = self.launcher_sell_amount.trim().to_string();
+        let pending = self.pending_confirm.clone();
+        self.run_launcher_action(ctx, move || {
+            sell_on_curve_job(curve_address, &paired_symbol, amount, &sender, pending)
+        });
     }
 
     /// The whole swap, start to finish, on one worker thread: quote, allowance
@@ -3095,6 +3237,44 @@ impl SushiTool {
                 }
             }
         }
+        if let Some(rx) = &self.launcher_curves_rx {
+            match rx.try_recv() {
+                Ok(Ok(Outcome::CurveList { curves })) => {
+                    self.launcher_curves = curves;
+                    self.launcher_curves_err = None;
+                    self.launcher_curves_at = Some(Instant::now());
+                    self.launcher_curves_rx = None;
+                }
+                Ok(Ok(_)) => self.launcher_curves_rx = None, // unreachable: list_curves only ever returns CurveList
+                Ok(Err(e)) => {
+                    self.launcher_curves_err = Some(e);
+                    self.launcher_curves_at = Some(Instant::now());
+                    self.launcher_curves_rx = None;
+                }
+                Err(TryRecvError::Empty) => ui.ctx().request_repaint(),
+                Err(TryRecvError::Disconnected) => self.launcher_curves_rx = None,
+            }
+        }
+        if let Some(rx) = &self.launcher_action_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.launcher_action_busy_since = None;
+                    // A successful launch/buy/sell just changed the board —
+                    // refresh it so the new/updated curve shows up without
+                    // the user having to know to ask for it again.
+                    if result.is_ok() {
+                        self.launcher_curves_at = None;
+                    }
+                    self.launcher_last_result = Some(result);
+                    self.launcher_action_rx = None;
+                }
+                Err(TryRecvError::Empty) => ui.ctx().request_repaint(),
+                Err(TryRecvError::Disconnected) => {
+                    self.launcher_action_busy_since = None;
+                    self.launcher_action_rx = None;
+                }
+            }
+        }
         if let Some(rx) = &self.preview_rx {
             match rx.try_recv() {
                 Ok(Ok(q)) => {
@@ -3477,6 +3657,11 @@ impl Tool for SushiTool {
                     self.ondo_section(ui);
                 });
             }
+            Tab::Launcher => {
+                egui::ScrollArea::vertical().id_salt("launcher_scroll").show(ui, |ui| {
+                    self.launcher_tab(ui);
+                });
+            }
         }
     }
 }
@@ -3484,9 +3669,12 @@ impl Tool for SushiTool {
 impl SushiTool {
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            for (tab, label) in
-                [(Tab::Chat, "Chat"), (Tab::Robinhood, "Robinhood"), (Tab::Ondo, "Ondo")]
-            {
+            for (tab, label) in [
+                (Tab::Chat, "Chat"),
+                (Tab::Robinhood, "Robinhood"),
+                (Tab::Ondo, "Ondo"),
+                (Tab::Launcher, "Launch"),
+            ] {
                 let active = self.active_tab == tab;
                 let text = RichText::new(label).color(if active { ACCENT } else { DIM }).strong();
                 if ui.selectable_label(active, text).clicked() {
@@ -3497,6 +3685,213 @@ impl SushiTool {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
+    }
+
+    /// Non-agentic door onto the bonding-curve feature: a launch form, a
+    /// browse list of every token launched so far, and inline buy/sell —
+    /// no chat, no model call, same underlying jobs the chat tools use.
+    fn launcher_tab(&mut self, ui: &mut egui::Ui) {
+        if !self.bonding.use_testnet {
+            ui.label(RichText::new("BONDING-CURVE LAUNCHER").color(ORANGE).small().strong());
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "Off by default — testnet only, no real money. Turn on \"Enable on \
+                     Robinhood Chain testnet\" in the Chat tab's settings (scroll below the \
+                     conversation) to use this.",
+                )
+                .color(DIM)
+                .small(),
+            );
+            return;
+        }
+        if self.bonding.factory_address.trim().is_empty() {
+            ui.label(
+                RichText::new(
+                    "no bonding-curve factory address configured yet — set one in the Chat \
+                     tab's settings",
+                )
+                .color(RED)
+                .small(),
+            );
+            return;
+        }
+        if self.launcher_curves_at.is_none() && self.launcher_curves_rx.is_none() {
+            let ctx = ui.ctx().clone();
+            self.refresh_launcher_curves(&ctx);
+        }
+
+        self.launcher_launch_form(ui);
+
+        if let Some(result) = &self.launcher_last_result {
+            ui.add_space(10.0);
+            match result {
+                Ok(outcome) => assistant_bubble(ui, |ui| result_card_inner(ui, outcome)),
+                Err(e) => {
+                    ui.label(RichText::new(format!("✗ {e}")).color(RED).small());
+                }
+            }
+        }
+
+        ui.add_space(18.0);
+        ui.separator();
+        ui.add_space(14.0);
+        self.launcher_curve_list(ui);
+    }
+
+    fn launcher_launch_form(&mut self, ui: &mut egui::Ui) {
+        let Ok(chain) = testnet_chain() else {
+            ui.label(RichText::new("Robinhood Chain testnet isn't configured").color(RED).small());
+            return;
+        };
+        ui.label(RichText::new("LAUNCH A TOKEN").color(ORANGE).small().strong());
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("name").color(FAINT).small());
+            ui.add(
+                egui::TextEdit::singleline(&mut self.launcher_launch_name)
+                    .desired_width(160.0)
+                    .hint_text("Moon Token"),
+            );
+            ui.label(RichText::new("symbol").color(FAINT).small());
+            ui.add(
+                egui::TextEdit::singleline(&mut self.launcher_launch_symbol)
+                    .desired_width(90.0)
+                    .hint_text("MOON"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("paired with").color(FAINT).small());
+            let selected_label = chain.tokens.get(self.launcher_launch_paired_idx).map(|t| t.symbol).unwrap_or("?");
+            egui::ComboBox::from_id_salt("launcher_paired_stock").selected_text(selected_label).show_ui(ui, |ui| {
+                for (i, t) in chain.tokens.iter().enumerate() {
+                    ui.selectable_value(&mut self.launcher_launch_paired_idx, i, t.symbol);
+                }
+            });
+            ui.label(RichText::new("graduation threshold").color(FAINT).small());
+            ui.add(egui::TextEdit::singleline(&mut self.launcher_launch_threshold).desired_width(80.0));
+        });
+        ui.add_space(6.0);
+
+        let wallet_ready = self.wallet.is_some();
+        let busy = self.launcher_action_rx.is_some();
+        let ready = wallet_ready
+            && !busy
+            && !self.launcher_launch_name.trim().is_empty()
+            && !self.launcher_launch_symbol.trim().is_empty()
+            && !self.launcher_launch_threshold.trim().is_empty();
+        ui.horizontal(|ui| {
+            if tool_button(ui, "Launch", ready) && ready {
+                let ctx = ui.ctx().clone();
+                self.submit_launch(&ctx);
+            }
+            if !wallet_ready {
+                ui.label(RichText::new("import a wallet first (Chat tab)").color(FAINT).small());
+            } else if busy {
+                ui.add(egui::Spinner::new().size(13.0).color(ORANGE));
+            }
+        });
+    }
+
+    /// The browse list — every curve the factory has launched, newest last,
+    /// with an inline Buy/Sell for whichever one is expanded
+    /// (`launcher_selected`). Snapshots `launcher_curves` into a local
+    /// `Vec` before iterating so the row widgets can still borrow other
+    /// `self` fields (the amount inputs) mutably at the same time.
+    fn launcher_curve_list(&mut self, ui: &mut egui::Ui) {
+        let loading = self.launcher_curves_rx.is_some();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("LAUNCHED TOKENS").color(ACCENT).small().strong());
+            ui.label(RichText::new(format!("{} so far", self.launcher_curves.len())).color(FAINT).small());
+            if loading {
+                ui.add(egui::Spinner::new().size(13.0).color(ACCENT));
+            } else if let Some(at) = self.launcher_curves_at {
+                ui.label(RichText::new(ago(at.elapsed().as_secs())).color(FAINT).small());
+            }
+            if tool_button(ui, "Refresh", !loading) && !loading {
+                let ctx = ui.ctx().clone();
+                self.refresh_launcher_curves(&ctx);
+            }
+        });
+        ui.add_space(8.0);
+
+        if let Some(e) = &self.launcher_curves_err {
+            ui.label(RichText::new(format!("✗ {e}")).color(RED).small());
+            return;
+        }
+        if self.launcher_curves.is_empty() {
+            let msg = if loading { "loading…" } else { "nothing launched on this factory yet" };
+            ui.label(RichText::new(msg).color(FAINT).small());
+            return;
+        }
+
+        let rows = self.launcher_curves.clone();
+        let wallet_ready = self.wallet.is_some();
+        let action_busy = self.launcher_action_rx.is_some();
+        let mut trade_action: Option<(String, String, bool)> = None;
+        for c in &rows {
+            egui::Frame::NONE
+                .fill(BG_ELEVATED)
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&c.token_symbol).color(FG).strong());
+                        ui.label(RichText::new(&c.token_name).color(DIM).small());
+                        if c.graduated {
+                            ui.label(RichText::new("graduated").color(UP).small());
+                        } else {
+                            let expanded = self.launcher_selected.as_deref() == Some(c.curve_address.as_str());
+                            if tool_button(ui, if expanded { "Close" } else { "Trade" }, true) {
+                                self.launcher_selected =
+                                    if expanded { None } else { Some(c.curve_address.clone()) };
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new(format!(
+                            "{} of {} {} raised",
+                            c.raised, c.graduation_threshold, c.paired_symbol
+                        ))
+                        .color(FAINT)
+                        .small(),
+                    );
+
+                    let expanded = self.launcher_selected.as_deref() == Some(c.curve_address.as_str());
+                    if expanded && !c.graduated {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.launcher_buy_amount).desired_width(80.0));
+                            ui.label(RichText::new(format!("{} → Buy", c.paired_symbol)).color(FAINT).small());
+                            if tool_button(ui, "Buy", wallet_ready && !action_busy) {
+                                trade_action = Some((c.curve_address.clone(), c.paired_symbol.clone(), true));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.launcher_sell_amount).desired_width(80.0));
+                            ui.label(RichText::new("tokens → Sell").color(FAINT).small());
+                            if tool_button(ui, "Sell", wallet_ready && !action_busy) {
+                                trade_action = Some((c.curve_address.clone(), c.paired_symbol.clone(), false));
+                            }
+                        });
+                        if !wallet_ready {
+                            ui.label(RichText::new("import a wallet first (Chat tab)").color(FAINT).small());
+                        } else if action_busy {
+                            ui.add(egui::Spinner::new().size(13.0).color(ACCENT));
+                        }
+                    }
+                });
+            ui.add_space(6.0);
+        }
+
+        if let Some((addr, symbol, is_buy)) = trade_action {
+            let ctx = ui.ctx().clone();
+            if is_buy {
+                self.submit_buy(&ctx, addr, symbol);
+            } else {
+                self.submit_sell(&ctx, addr, symbol);
+            }
+        }
     }
 
     /// Robinhood tab's own way in — a bare ticker box, the same fast path
